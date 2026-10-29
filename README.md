@@ -167,6 +167,34 @@ memory-native model such as MemT-1.0 keeps memory as internal layer tensors,
 strictly isolated per history with no text or embedding export, so its memory
 can never be read by another agent. Letta's is files, so it can.
 
+### Deploying to other hosts
+
+`deploy-letta` installs and configures Letta over SSH, so a second machine is
+one command rather than a checklist:
+
+```sh
+deploy-letta studio amd            # any SSH target: alias or user@host
+deploy-letta studio --dry-run      # print the plan, touch nothing
+deploy-letta studio --verify --model ollama/qwen2.5-coder:7b
+```
+
+Every step probes before acting, so re-running on a configured host is a no-op.
+A failure on one host does not abandon the others, and an SSH connection
+failure is reported separately from a remote command failing.
+
+It resolves Node the way you would: use the host's default if it already
+satisfies Letta's `>= 22.19`, otherwise the newest suitable nvm install, rather
+than installing a second copy. It reports an engine that is installed but
+stopped differently from one that is absent, because the fix differs — and it
+looks in Homebrew and snap prefixes explicitly, since a non-interactive SSH
+shell does not always have them on `PATH`.
+
+Checks worth knowing about: the backend is re-read after being switched rather
+than trusted, since `letta backend` prints the current default *and* a hint
+naming both commands — a substring search for "local" matches even on Cloud.
+Models are checked for tool support, and the report notes Letta's context
+floor.
+
 ### Running it entirely locally
 
 Letta Code and its App Server are Apache-2.0, so the whole stack can be
