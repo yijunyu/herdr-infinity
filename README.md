@@ -229,13 +229,22 @@ printf 'FROM qwen2.5-coder:7b\nPARAMETER num_ctx 32768\n' > qwen32k.modelfile
 ollama create qwen2.5-coder-32k -f qwen32k.modelfile
 ```
 
-On the CPU-only machine this was developed on, that got past the context check
-but still did not produce a completed turn, and a 64k variant would not stay
-resident. **Driving Letta from a local model is therefore not proven here** —
-treat it as needing a GPU or a larger served context. To diagnose a silent
-turn, read
+Hardware decides whether that is enough. On a CPU-only host (48 cores, 62 GB)
+the same model and the same 32k derived model never produced a reply. On an
+Apple Silicon host (Darwin arm64, 128 GB unified memory, with
+`OLLAMA_FLASH_ATTENTION=1` and `OLLAMA_KV_CACHE_TYPE=q8_0`, both set by the
+Homebrew service) the identical setup answered:
+
+```console
+$ letta -p "Reply with exactly: LOCAL OK" --model ollama/qwen2.5-coder-32k
+LOCAL OK
+```
+
+To diagnose a silent turn, read
 `~/.letta/lc-local-backend/conversations/<id>/messages.jsonl`: a user message
-with no assistant entry means the model never produced one.
+with no assistant entry means the model never produced one. That is the
+difference between the two hosts — the CPU box recorded only the user message,
+the Apple Silicon box recorded `assistant -> LOCAL OK`.
 
 None of this affects the memory bridge, which reads and writes files and does
 not care which model — or whether any model — produced them.
