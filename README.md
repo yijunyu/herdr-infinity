@@ -183,13 +183,34 @@ the default port; `llama-cpp` defaults to `localhost:8080/v1`, so a server on
 another port needs `LLAMA_CPP_BASE_URL`. Confirm what Letta can see with
 `letta model list`.
 
-**The model must support tool calls.** Letta Code is an agent harness — memory
-edits, file operations, and shell commands all go through tools — so a model
-without tool support produces an empty turn rather than an error. `llama3` and
-`phi3` report `does not support tools` through Ollama's OpenAI endpoint and
-cannot drive it; `qwen2.5-coder`, `qwen3`, and `llama3.1` and newer can. A
-completion-only `llama-server` model is likewise unusable as an agent, however
-good it is at text.
+**The model must support tool calls, and carry a large context.** Letta Code is
+an agent harness — memory edits, file operations, and shell commands all go
+through tools — so a model without tool support produces an empty turn rather
+than an error. `llama3` and `phi3` report `does not support tools` through
+Ollama's OpenAI endpoint and cannot drive it; `qwen2.5-coder`, `qwen3`, and
+`llama3.1` and newer can. A completion-only `llama-server` model is likewise
+unusable as an agent, however good it is at text.
+
+Tool support alone is not enough. Letta's system prompt and tool definitions
+need roughly 28k tokens, while Ollama serves 4,096 by default, so it refuses to
+send the prompt rather than let the engine truncate memory and persona
+silently. A derived model raises the window without restarting a shared daemon:
+
+```sh
+printf 'FROM qwen2.5-coder:7b\nPARAMETER num_ctx 32768\n' > qwen32k.modelfile
+ollama create qwen2.5-coder-32k -f qwen32k.modelfile
+```
+
+On the CPU-only machine this was developed on, that got past the context check
+but still did not produce a completed turn, and a 64k variant would not stay
+resident. **Driving Letta from a local model is therefore not proven here** —
+treat it as needing a GPU or a larger served context. To diagnose a silent
+turn, read
+`~/.letta/lc-local-backend/conversations/<id>/messages.jsonl`: a user message
+with no assistant entry means the model never produced one.
+
+None of this affects the memory bridge, which reads and writes files and does
+not care which model — or whether any model — produced them.
 
 ## Commands
 
