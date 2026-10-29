@@ -1,0 +1,38 @@
+id = "yijunyu.herdr-infinity"
+name = "Infinity Code"
+version = "0.2.0"
+min_herdr_version = "0.9.0"
+description = "Manage Infinity Code sessions from Herdr: list, open, and start sessions, and report agent state."
+platforms = ["linux", "macos"]
+
+# State reporting lives in `herdr-infinity run`, not here: an action is a
+# one-shot process and cannot hold the daemon subscription that reporting
+# needs. These entries are the management surface only.
+
+[[actions]]
+id = "new-session"
+title = "Infinity: new session"
+contexts = ["workspace"]
+command = ["plugin/run.sh", "new"]
+
+[[actions]]
+id = "list-sessions"
+title = "Infinity: list sessions"
+contexts = ["workspace"]
+command = ["plugin/run.sh", "sessions", "--all"]
+
+[[actions]]
+id = "doctor"
+title = "Infinity: diagnose integration"
+contexts = ["workspace"]
+command = ["plugin/run.sh", "doctor"]
+
+# The picker is a pane rather than an action so its output stays on screen
+# while the user reads session ids and then runs `herdr-infinity open <id>`.
+[[panes]]
+id = "session-picker"
+title = "Infinity sessions"
+command = ["plugin/run.sh", "sessions", "--all"]
+placement = "popup"
+width = 100
+height = 24

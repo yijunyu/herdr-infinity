@@ -382,6 +382,45 @@ fn is_timeout(error: &io::Error) -> bool {
     )
 }
 
+/// Ask the daemon for its live session list and disconnect.
+///
+/// The daemon sends `Welcome` to every client that connects, so a passive
+/// observer can learn the live statuses without ever sending a message. Used by
+/// the management surface, which runs as a short-lived command rather than for
+/// the lifetime of a pane. Returns `None` when the daemon is not reachable
+/// within `timeout`; callers degrade to the on-disk store.
+pub fn probe_daemon_sessions(timeout: Duration) -> Option<HashMap<String, SessionInfo>> {
+    let socket = crate::home_dir().join(".infinity").join("daemon.sock");
+    let deadline = Instant::now() + timeout;
+
+    let mut stream = UnixStream::connect(&socket).ok()?;
+    stream.set_read_timeout(Some(READ_TIMEOUT)).ok()?;
+
+    let mut reader = FrameReader::new();
+    while Instant::now() < deadline {
+        let frames = match reader.poll(&mut stream) {
+            Ok(frames) => frames,
+            Err(error) if is_timeout(&error) => continue,
+            Err(_) => return None,
+        };
+        for frame in frames {
+            let Ok(value) = serde_json::from_slice::<Value>(&frame) else {
+                continue;
+            };
+            // `Welcome` carries the full list; `SessionsUpdated` may arrive
+            // first if a session changes while we are connecting.
+            let sessions = value
+                .get("Welcome")
+                .or_else(|| value.get("SessionsUpdated"))
+                .and_then(|message| message.get("sessions"));
+            if let Some(sessions) = sessions {
+                return Some(parse_sessions(sessions));
+            }
+        }
+    }
+    None
+}
+
 /// Run the bridge until the child exits (and, for `-H`, until its session
 /// goes idle). Returns the child's exit status.
 pub fn bridge(

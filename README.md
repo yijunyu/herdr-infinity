@@ -84,15 +84,65 @@ The chosen session is kept until it is archived or removed. Run one Infinity ins
 
 `infinity --local` runs the agent in the TUI process with no daemon, so there is no state to observe. The wrapper still runs it, but does not report state.
 
+## Session management (Herdr plugin)
+
+State reporting answers "what is this pane doing?". The plugin answers the
+complementary question: "what sessions exist, and how do I open one?".
+
+```sh
+herdr plugin link /path/to/herdr-infinity
+```
+
+That registers three workspace actions and a session-picker pane:
+
+| Surface | Command |
+| --- | --- |
+| Action — Infinity: new session | `herdr-infinity new` |
+| Action — Infinity: list sessions | `herdr-infinity sessions --all` |
+| Action — Infinity: diagnose integration | `herdr-infinity doctor` |
+| Pane — Infinity sessions (popup) | `herdr-infinity sessions --all` |
+
+Session management is deliberately *not* implemented as state reporting.
+A plugin action is a one-shot process, so it cannot hold the daemon
+subscription that `idle`/`working`/`blocked` needs; that stays in
+`herdr-infinity run`. The two halves are independent — the plugin is useful
+without the shim, and the shim without the plugin.
+
+Opening a session goes through Herdr (`pane split`, then `pane run`) rather
+than spawning Infinity directly, so the new pane is an ordinary Herdr pane
+that reports its own state. `open` refuses an archived session and refuses an
+ambiguous prefix rather than guessing which conversation you meant.
+
+### The launcher
+
+The manifest invokes `plugin/run.sh`, not `herdr-infinity` directly. Herdr
+runs plugin commands with the **server's** environment, which is frequently
+just the system `PATH` — a server started from a desktop session sees neither
+`~/.cargo/bin` nor `~/.local/bin`, so a bare `herdr-infinity` command fails
+with `No such file or directory`. The launcher resolves the binary explicitly:
+`$HERDR_INFINITY_BIN`, then the plugin root's own `target/release` and
+`target/debug` (so a linked checkout works without installing), then
+`$CARGO_HOME/bin`, `~/.local/bin`, `/usr/local/bin`, `/usr/bin`, and finally
+`PATH`. Set `HERDR_INFINITY_BIN` if your installation is somewhere else.
+
 ## Commands
 
 ```text
 herdr-infinity run [--] [infinity arguments...]
+herdr-infinity sessions [--all] [--here]
+herdr-infinity open <session-prefix> [--focus]
+herdr-infinity new [--focus]
 herdr-infinity doctor
 herdr-infinity install-shim [--dir <dir>] [--force]
 herdr-infinity uninstall-shim [--dir <dir>]
 herdr-infinity version
 ```
+
+`sessions` lists live sessions (`--all` includes archived, `--here` restricts
+to the current directory) by joining `~/.infinity/sessions.json` with the
+daemon's live view. With no daemon running it degrades to the store alone
+rather than failing. `open` and `new` create a pane and so require a Herdr
+session; `sessions` and `doctor` work anywhere.
 
 `doctor` prints the Herdr environment, the resolved Infinity binary, the daemon socket, and the sessions recorded in `~/.infinity/sessions.json`.
 
@@ -106,7 +156,8 @@ Set `HERDR_INFINITY_DEBUG=1` to append diagnostics to `$XDG_STATE_HOME/herdr-inf
 
 ## Limitations
 
-- This is an integration, not a Herdr built-in. Herdr will not auto-detect `infinity` unless the shim is on `PATH` or you launch through `herdr-infinity run`.
+- This is an integration, not a Herdr built-in. `infinity` is not among Herdr 0.9.1's built-in agent kinds, so `herdr agent start --kind infinity` does not exist; Herdr will not auto-detect `infinity` unless the shim is on `PATH` or you launch through `herdr-infinity run`.
+- The plugin's session picker is a listing, not an interactive menu. Herdr plugin panes run a command; they do not provide a selection widget. Read the id from the picker and run `herdr-infinity open <id>`.
 - Session switching inside the TUI (`/load`) is not followed once a session is selected; start a new pane or pass `-s` if you need a different session tracked.
 - Infinity's daemon protocol is not a stable public API. The reader is deliberately tolerant: unknown messages are ignored, unknown statuses leave the last reported state unchanged, and a malformed `sessions.json` is treated as empty. If the framing changes, the bridge disconnects and retries rather than crashing the agent.
 - `--local` and multiple Infinity panes in one directory have the caveats described above.

@@ -12,6 +12,8 @@
 
 mod herdr;
 mod infinity;
+mod plugin;
+mod sessions;
 mod shim;
 
 use std::path::PathBuf;
@@ -30,6 +32,16 @@ Usage:
   herdr-infinity run [--] [infinity arguments...]
       Run Infinity in this pane and report idle/working/blocked to Herdr.
       Outside Herdr this simply execs the real `infinity` binary.
+
+  herdr-infinity sessions [--all] [--here]
+      List Infinity sessions. Live sessions only unless --all; --here
+      restricts the list to the current directory.
+
+  herdr-infinity open <session-prefix> [--focus]
+      Open an existing session in a new Herdr pane.
+
+  herdr-infinity new [--focus]
+      Start a fresh Infinity session in a new Herdr pane.
 
   herdr-infinity doctor
       Print what the integration can see (Herdr env, Infinity binary,
@@ -73,6 +85,9 @@ fn dispatch(args: Vec<String>) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
         Some("run") => cmd_run(args[1..].to_vec()),
+        Some("sessions") => cmd_sessions(&args[1..]),
+        Some("open") => cmd_open(&args[1..]),
+        Some("new") => cmd_new(&args[1..]),
         Some("doctor") => cmd_doctor(),
         Some("install-shim") => cmd_install_shim(&args[1..]),
         Some("uninstall-shim") => cmd_uninstall_shim(&args[1..]),
@@ -152,6 +167,81 @@ fn exit_code(status: std::process::ExitStatus) -> u8 {
         Some(code) => code as u8,
         None => 128u8.saturating_add(status.signal().unwrap_or(0) as u8),
     }
+}
+
+fn cmd_sessions(args: &[String]) -> Result<ExitCode, String> {
+    let mut all = false;
+    let mut here = false;
+    for arg in args {
+        match arg.as_str() {
+            "--all" | "-a" => all = true,
+            "--here" => here = true,
+            other => return Err(format!("unexpected argument {other:?} for sessions")),
+        }
+    }
+
+    let dir = if here {
+        Some(
+            std::env::current_dir()
+                .map_err(|error| format!("cannot read current directory: {error}"))?,
+        )
+    } else {
+        None
+    };
+
+    print!("{}", plugin::list_sessions(all, dir.as_ref()));
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_open(args: &[String]) -> Result<ExitCode, String> {
+    let mut prefix: Option<&str> = None;
+    let mut focus = false;
+    for arg in args {
+        match arg.as_str() {
+            "--focus" => focus = true,
+            other if other.starts_with('-') => {
+                return Err(format!("unexpected argument {other:?} for open"))
+            }
+            other => {
+                if prefix.replace(other).is_some() {
+                    return Err("open takes a single session prefix".to_owned());
+                }
+            }
+        }
+    }
+
+    let prefix = prefix.ok_or_else(|| "open needs a session id or prefix".to_owned())?;
+    require_herdr()?;
+    let ctx = plugin::Context::from_env();
+    println!("{}", plugin::open_session(&ctx, prefix, focus)?);
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_new(args: &[String]) -> Result<ExitCode, String> {
+    let mut focus = false;
+    for arg in args {
+        match arg.as_str() {
+            "--focus" => focus = true,
+            other => return Err(format!("unexpected argument {other:?} for new")),
+        }
+    }
+
+    require_herdr()?;
+    let ctx = plugin::Context::from_env();
+    println!("{}", plugin::new_session(&ctx, focus)?);
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Commands that create panes need a live Herdr session to talk to.
+fn require_herdr() -> Result<(), String> {
+    if herdr::active() {
+        return Ok(());
+    }
+    Err(
+        "not running inside a Herdr pane (HERDR_ENV, HERDR_PANE_ID, and \
+         HERDR_BIN_PATH must be set)"
+            .to_owned(),
+    )
 }
 
 fn cmd_doctor() -> Result<ExitCode, String> {
