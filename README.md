@@ -125,11 +125,47 @@ with `No such file or directory`. The launcher resolves the binary explicitly:
 `$CARGO_HOME/bin`, `~/.local/bin`, `/usr/local/bin`, `/usr/bin`, and finally
 `PATH`. Set `HERDR_INFINITY_BIN` if your installation is somewhere else.
 
+## Memory: bridging Letta's MemFS and Claude Code
+
+Letta Code stores agent memory as **git-tracked Markdown** under
+`$MEMORY_DIR/system/`, one fact per file, with YAML frontmatter whose
+`description` decides when the fact is relevant. Claude Code's memory
+directory uses the same shape, plus a `name`, a `metadata.type`, and a
+`MEMORY.md` index. Because both substrates are plain text, memory can move
+between them:
+
+```sh
+herdr-infinity memfs status                      # what each side has
+herdr-infinity memfs import                      # MemFS      -> Claude Code
+herdr-infinity memfs export                      # Claude Code -> MemFS
+herdr-infinity memfs import --dry-run            # show the plan only
+```
+
+`--memory-dir` defaults to `$MEMORY_DIR` (Letta sets it for an agent session);
+`--claude-dir` defaults to the directory Claude Code derives from the current
+project path. Syncing is always explicit — memory steers an agent's behaviour
+for a long time, so nothing is written on a timer or behind your back, and
+`--dry-run` shows the plan first.
+
+Round trips settle: `import` then `export` leaves both sides reporting
+"nothing to do", and `letta memory tokens --memory-dir <dir>` parses what the
+bridge writes. Only `description` and the body are compared, since
+`metadata.type` has no MemFS equivalent and would otherwise show a spurious
+change on every file. `MEMORY.md` is rebuilt from the files that exist rather
+than merged, so a stale entry cannot survive.
+
+This is the part of the memory question that is actually tractable. A
+memory-native model such as MemT-1.0 keeps memory as internal layer tensors,
+strictly isolated per history with no text or embedding export, so its memory
+can never be read by another agent. Letta's is files, so it can.
+
 ## Commands
 
 ```text
 herdr-infinity run [--] [infinity arguments...]
 herdr-infinity sessions [--all] [--here]
+herdr-infinity memfs <import|export|status> [--memory-dir <dir>]
+                                           [--claude-dir <dir>] [--dry-run]
 herdr-infinity open <session-prefix> [--focus]
 herdr-infinity new [--focus]
 herdr-infinity doctor

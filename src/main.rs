@@ -12,6 +12,7 @@
 
 mod herdr;
 mod infinity;
+mod memfs;
 mod plugin;
 mod sessions;
 mod shim;
@@ -42,6 +43,15 @@ Usage:
 
   herdr-infinity new [--focus]
       Start a fresh Infinity session in a new Herdr pane.
+
+  herdr-infinity memfs <import|export|status> [options]
+      Sync memory between Letta's MemFS and Claude Code's memory
+      directory. Both store one fact per Markdown file with a
+      `description`, so the two interoperate.
+        --memory-dir <dir>  MemFS root (default: $MEMORY_DIR)
+        --claude-dir <dir>  Claude Code memory dir (default: derived
+                            from the current project path)
+        --dry-run           Show the plan without writing
 
   herdr-infinity doctor
       Print what the integration can see (Herdr env, Infinity binary,
@@ -88,6 +98,7 @@ fn dispatch(args: Vec<String>) -> Result<ExitCode, String> {
         Some("sessions") => cmd_sessions(&args[1..]),
         Some("open") => cmd_open(&args[1..]),
         Some("new") => cmd_new(&args[1..]),
+        Some("memfs") => cmd_memfs(&args[1..]),
         Some("doctor") => cmd_doctor(),
         Some("install-shim") => cmd_install_shim(&args[1..]),
         Some("uninstall-shim") => cmd_uninstall_shim(&args[1..]),
@@ -229,6 +240,82 @@ fn cmd_new(args: &[String]) -> Result<ExitCode, String> {
     require_herdr()?;
     let ctx = plugin::Context::from_env();
     println!("{}", plugin::new_session(&ctx, focus)?);
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_memfs(args: &[String]) -> Result<ExitCode, String> {
+    let mut memory_dir: Option<PathBuf> = None;
+    let mut claude_dir: Option<PathBuf> = None;
+    let mut dry_run = false;
+    let mut mode: Option<&str> = None;
+
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--memory-dir" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--memory-dir needs a path".to_owned())?;
+                memory_dir = Some(PathBuf::from(value));
+                index += 2;
+            }
+            "--claude-dir" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--claude-dir needs a path".to_owned())?;
+                claude_dir = Some(PathBuf::from(value));
+                index += 2;
+            }
+            "--dry-run" | "-n" => {
+                dry_run = true;
+                index += 1;
+            }
+            other if other.starts_with('-') => {
+                return Err(format!("unexpected argument {other:?} for memfs"))
+            }
+            other => {
+                if mode.replace(other).is_some() {
+                    return Err("memfs takes a single subcommand".to_owned());
+                }
+                index += 1;
+            }
+        }
+    }
+
+    let mode = mode.ok_or_else(|| "memfs needs import, export, or status".to_owned())?;
+    let memfs_dir = memfs::resolve_memfs_dir(memory_dir)?;
+    let project = std::env::current_dir()
+        .map_err(|error| format!("cannot read current directory: {error}"))?;
+    let claude_dir = memfs::resolve_claude_dir(claude_dir, &project)?;
+
+    match mode {
+        "status" => {
+            // Report both directions so the user sees the whole picture
+            // before choosing one.
+            println!(
+                "MemFS:       {}",
+                memfs::memfs_system_dir(&memfs_dir).display()
+            );
+            println!("Claude Code: {}\n", claude_dir.display());
+            let import = memfs::sync(&memfs_dir, &claude_dir, memfs::Direction::Import, true)?;
+            print!("{}", import.render(memfs::Direction::Import));
+            let export = memfs::sync(&memfs_dir, &claude_dir, memfs::Direction::Export, true)?;
+            print!("{}", export.render(memfs::Direction::Export));
+        }
+        "import" | "export" => {
+            let direction = if mode == "import" {
+                memfs::Direction::Import
+            } else {
+                memfs::Direction::Export
+            };
+            let plan = memfs::sync(&memfs_dir, &claude_dir, direction, dry_run)?;
+            print!("{}", plan.render(direction));
+            if dry_run && !plan.is_empty() {
+                println!("(dry run: nothing was written)");
+            }
+        }
+        other => return Err(format!("unknown memfs subcommand {other:?}")),
+    }
     Ok(ExitCode::SUCCESS)
 }
 
