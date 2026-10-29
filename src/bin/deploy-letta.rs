@@ -289,7 +289,10 @@ fn pick_nvm_node(listing: &str) -> Option<(String, (u32, u32))> {
 /// Which local inference endpoints answered, and what they serve.
 #[derive(Debug, Default)]
 struct Engines {
+    /// Models reported by a *running* Ollama, if it answered.
     ollama: Option<Vec<String>>,
+    /// Path to an Ollama binary found while the API was down.
+    ollama_binary: Option<String>,
     llama_cpp: Option<String>,
 }
 
@@ -476,6 +479,21 @@ fn probe_engines(host: &str, timeout: Duration, options: &Options) -> Result<Eng
         )?;
         if !tags.trimmed().is_empty() {
             engines.ollama = Some(parse_ollama_models(tags.trimmed()));
+        } else {
+            // A stopped Ollama is a different problem from an absent one, and
+            // the fix differs: start the service vs install it. The binary may
+            // also sit in a prefix that a non-interactive shell does not
+            // search, so look in the usual ones explicitly.
+            let binary = ssh(
+                host,
+                "command -v ollama 2>/dev/null \
+                 || ls /opt/homebrew/bin/ollama /usr/local/bin/ollama \
+                       /snap/bin/ollama 2>/dev/null \
+                 | head -1 || true",
+                timeout,
+            )?;
+            engines.ollama_binary = (!binary.trimmed().is_empty())
+                .then(|| binary.trimmed().lines().next().unwrap_or("").to_owned());
         }
     }
 
@@ -532,9 +550,19 @@ fn render_engines(engines: &Engines) -> String {
                 writeln!(out, "    - {name}").ok();
             }
         }
-        None => {
-            writeln!(out, "  ollama: not reachable on :11434").ok();
-        }
+        None => match &engines.ollama_binary {
+            Some(path) => {
+                writeln!(
+                    out,
+                    "  ollama: installed at {path} but NOT running \
+                     (start it: `brew services start ollama`, or `ollama serve`)"
+                )
+                .ok();
+            }
+            None => {
+                writeln!(out, "  ollama: not installed and not reachable on :11434").ok();
+            }
+        },
     }
     match &engines.llama_cpp {
         Some(url) => {
@@ -897,6 +925,7 @@ mod tests {
     fn renders_engine_findings() {
         let engines = Engines {
             ollama: Some(vec!["qwen2.5-coder:7b".to_owned()]),
+            ollama_binary: None,
             llama_cpp: Some("http://127.0.0.1:18081/v1".to_owned()),
         };
         let text = render_engines(&engines);
@@ -905,7 +934,17 @@ mod tests {
         assert!(text.contains("18081"));
 
         let empty = render_engines(&Engines::default());
-        assert!(empty.contains("not reachable on :11434"));
+        assert!(empty.contains("not installed and not reachable"));
         assert!(empty.contains("llama.cpp: not reachable"));
+
+        // Installed but stopped is a distinct, actionable state: studio had
+        // Ollama in /opt/homebrew/bin while the API was down.
+        let stopped = render_engines(&Engines {
+            ollama: None,
+            ollama_binary: Some("/opt/homebrew/bin/ollama".to_owned()),
+            llama_cpp: None,
+        });
+        assert!(stopped.contains("NOT running"), "{stopped}");
+        assert!(stopped.contains("brew services start"), "{stopped}");
     }
 }
