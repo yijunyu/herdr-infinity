@@ -279,9 +279,38 @@ pub fn plan(source: &BTreeMap<String, Memo>, target: &BTreeMap<String, Memo>) ->
     plan
 }
 
-/// The MemFS system directory for a memory root.
+/// Where the memory files live inside a MemFS root.
+///
+/// MemFS uses two layouts in practice, so the directory is detected rather
+/// than assumed:
+///
+/// - `<root>/system/*.md`, which the bundled authoring instructions describe;
+/// - `<root>/*.md`, which is what Letta's local backend actually creates
+///   (`~/.letta/lc-local-backend/memfs/<agent>/memory/`).
+///
+/// Detection prefers whichever layout already holds memory files, so a sync
+/// writes back into the layout the directory is already using instead of
+/// imposing one. An empty or absent root falls back to `system/`, matching the
+/// documented layout for a directory we are creating from scratch.
 pub fn memfs_system_dir(memory_dir: &Path) -> PathBuf {
-    memory_dir.join("system")
+    let nested = memory_dir.join("system");
+    if has_memos(&nested) {
+        return nested;
+    }
+    if has_memos(memory_dir) {
+        return memory_dir.to_path_buf();
+    }
+    nested
+}
+
+/// True when a directory holds at least one parseable memory file.
+///
+/// Presence of `.md` files is not enough: a root may hold only `MEMORY.md`, or
+/// a stray README, neither of which is a memory fact.
+fn has_memos(dir: &Path) -> bool {
+    read_dir(dir)
+        .map(|memos| !memos.is_empty())
+        .unwrap_or(false)
 }
 
 /// Rebuild Claude Code's `MEMORY.md` index from the files present.
@@ -608,6 +637,78 @@ Herdr runs plugin commands with the server's PATH.
         let plan = sync(&memfs, &claude, Direction::Import, true).unwrap();
         assert_eq!(plan.changes.len(), 1);
         assert!(!claude.exists(), "dry run created the target directory");
+    }
+
+    /// The shape Letta's local backend actually writes: files at the memory
+    /// root, with `name` and `description` but no `metadata`.
+    const LIVE_FILE: &str = "\
+---
+name: Human
+description: What I've learned about the person I'm working with.
+---
+Learn sideways, through the work.
+Not a questionnaire.
+";
+
+    #[test]
+    fn detects_the_live_root_layout() {
+        let root = tempfile::tempdir().unwrap();
+        let memory = root.path().join("memory");
+        std::fs::create_dir_all(&memory).unwrap();
+        std::fs::write(memory.join("human.md"), LIVE_FILE).unwrap();
+        // A bare index at the root must not be mistaken for a memory file.
+        std::fs::write(memory.join("MEMORY.md"), "# Memory\n").unwrap();
+
+        assert_eq!(memfs_system_dir(&memory), memory);
+    }
+
+    #[test]
+    fn prefers_the_system_layout_when_it_holds_the_memos() {
+        let root = tempfile::tempdir().unwrap();
+        let memory = root.path().join("memory");
+        std::fs::create_dir_all(memory.join("system")).unwrap();
+        std::fs::write(memory.join("system/a.md"), MEMFS_FILE).unwrap();
+        // A root-level index must not pull detection away from system/.
+        std::fs::write(memory.join("MEMORY.md"), "# Memory\n").unwrap();
+
+        assert_eq!(memfs_system_dir(&memory), memory.join("system"));
+    }
+
+    #[test]
+    fn an_empty_root_defaults_to_the_documented_layout() {
+        let root = tempfile::tempdir().unwrap();
+        let memory = root.path().join("memory");
+        std::fs::create_dir_all(&memory).unwrap();
+        assert_eq!(memfs_system_dir(&memory), memory.join("system"));
+        // And a root that does not exist at all.
+        assert_eq!(
+            memfs_system_dir(&root.path().join("absent")),
+            root.path().join("absent/system")
+        );
+    }
+
+    #[test]
+    fn imports_from_a_live_root_layout_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let memory = root.path().join("memory");
+        let claude = root.path().join("claude");
+        std::fs::create_dir_all(&memory).unwrap();
+        std::fs::write(memory.join("human.md"), LIVE_FILE).unwrap();
+        std::fs::write(memory.join("MEMORY.md"), "# Memory\n").unwrap();
+
+        let plan = sync(&memory, &claude, Direction::Import, false).unwrap();
+        // The frontmatter `name` is the identity, not the file stem.
+        assert_eq!(plan.changes, [Change::Create("Human".to_owned())]);
+
+        let written = std::fs::read_to_string(claude.join("Human.md")).unwrap();
+        assert!(written.contains("name: Human"));
+        // MemFS carries no type, so the import defaults it.
+        assert!(written.contains("type: reference"));
+
+        // Writing back must land in the same layout, not create system/.
+        let back = sync(&memory, &claude, Direction::Export, false).unwrap();
+        assert!(back.is_empty(), "{:?}", back.changes);
+        assert!(!memory.join("system").exists());
     }
 
     #[test]

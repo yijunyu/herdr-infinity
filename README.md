@@ -141,6 +141,14 @@ herdr-infinity memfs export                      # Claude Code -> MemFS
 herdr-infinity memfs import --dry-run            # show the plan only
 ```
 
+MemFS uses two layouts, and the bridge detects which one a directory is
+using rather than assuming: `<root>/system/*.md`, as the bundled authoring
+instructions describe, and `<root>/*.md`, which is what Letta's local backend
+actually creates under
+`~/.letta/lc-local-backend/memfs/<agent>/memory/`. A sync writes back into
+whichever layout is already in use, so it never reorganises an agent's memory;
+an empty root falls back to `system/`.
+
 `--memory-dir` defaults to `$MEMORY_DIR` (Letta sets it for an agent session);
 `--claude-dir` defaults to the directory Claude Code derives from the current
 project path. Syncing is always explicit — memory steers an agent's behaviour
@@ -158,6 +166,30 @@ This is the part of the memory question that is actually tractable. A
 memory-native model such as MemT-1.0 keeps memory as internal layer tensors,
 strictly isolated per history with no text or embedding export, so its memory
 can never be read by another agent. Letta's is files, so it can.
+
+### Running it entirely locally
+
+Letta Code and its App Server are Apache-2.0, so the whole stack can be
+self-hosted with no account:
+
+```sh
+letta backend local        # agents and state under ~/.letta/lc-local-backend/
+letta connect ollama       # auto-detects http://localhost:11434/v1
+LLAMA_CPP_BASE_URL=http://127.0.0.1:18081/v1 letta connect llama-cpp
+```
+
+Neither local provider needs an API key. `letta connect ollama` auto-detects
+the default port; `llama-cpp` defaults to `localhost:8080/v1`, so a server on
+another port needs `LLAMA_CPP_BASE_URL`. Confirm what Letta can see with
+`letta model list`.
+
+**The model must support tool calls.** Letta Code is an agent harness — memory
+edits, file operations, and shell commands all go through tools — so a model
+without tool support produces an empty turn rather than an error. `llama3` and
+`phi3` report `does not support tools` through Ollama's OpenAI endpoint and
+cannot drive it; `qwen2.5-coder`, `qwen3`, and `llama3.1` and newer can. A
+completion-only `llama-server` model is likewise unusable as an agent, however
+good it is at text.
 
 ## Commands
 
