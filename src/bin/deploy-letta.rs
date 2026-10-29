@@ -58,6 +58,8 @@ impl Engine {
 
 struct Options {
     hosts: Vec<String>,
+    /// Jump host for targets only reachable from another machine.
+    via: Option<String>,
     dry_run: bool,
     engine: Engine,
     llama_cpp_url: Option<String>,
@@ -79,7 +81,11 @@ fn main() -> std::process::ExitCode {
     let mut failures = 0;
     for host in &options.hosts {
         println!("\n=== {host} ===");
-        match deploy(host, &options) {
+        let target = Target {
+            host: host.clone(),
+            via: options.via.clone(),
+        };
+        match deploy(&target, &options) {
             Ok(report) => print!("{report}"),
             Err(error) => {
                 // One unreachable host must not abandon the rest.
@@ -103,6 +109,8 @@ Usage:
   deploy-letta <host>... [options]
 
 Options:
+  --via <host>           Reach the target through this jump host (ssh -J),
+                         for a target only resolvable on another network.
   --dry-run              Print the plan; touch nothing.
   --engine <e>           auto (default), ollama, llama-cpp, none.
   --llama-cpp-url <url>  Base URL for llama.cpp (default: probe :8080, :18081).
@@ -117,6 +125,7 @@ Each step probes before acting, so re-running is a no-op on a ready host.
 
 fn parse_args(args: Vec<String>) -> Result<Option<Options>, String> {
     let mut hosts = Vec::new();
+    let mut via = None;
     let mut dry_run = false;
     let mut engine = Engine::Auto;
     let mut llama_cpp_url = None;
@@ -138,6 +147,10 @@ fn parse_args(args: Vec<String>) -> Result<Option<Options>, String> {
             "--verify" => {
                 verify = true;
                 index += 1;
+            }
+            "--via" => {
+                via = Some(need(&args, index, "--via")?.to_owned());
+                index += 2;
             }
             "--engine" => {
                 engine = Engine::parse(need(&args, index, "--engine")?)?;
@@ -173,6 +186,7 @@ fn parse_args(args: Vec<String>) -> Result<Option<Options>, String> {
     }
     Ok(Some(Options {
         hosts,
+        via,
         dry_run,
         engine,
         llama_cpp_url,
@@ -208,13 +222,41 @@ impl Output {
 /// `BatchMode=yes` keeps the driver non-interactive: a host needing a password
 /// or an unknown-key confirmation fails fast with a clear message instead of
 /// hanging on a prompt nobody can see.
-fn ssh(host: &str, script: &str, timeout: Duration) -> Result<Output, String> {
+/// A deployment target: the host, plus the jump host needed to reach it.
+#[derive(Clone)]
+struct Target {
+    host: String,
+    via: Option<String>,
+}
+
+impl Target {
+    /// Run a command on this target.
+    fn run(&self, script: &str, timeout: Duration) -> Result<Output, String> {
+        ssh_via(&self.host, self.via.as_deref(), script, timeout)
+    }
+}
+
+/// Run a command on `host`, optionally reaching it through a jump host.
+///
+/// A host on a private network is often resolvable only from a machine on that
+/// network, so `--via` lets the driver deploy to it without a VPN or a copied
+/// key. SSH performs the hop itself, so nothing is staged on the jump host.
+fn ssh_via(
+    host: &str,
+    via: Option<&str>,
+    script: &str,
+    timeout: Duration,
+) -> Result<Output, String> {
     let mut command = Command::new("ssh");
     command
         .arg("-o")
         .arg("BatchMode=yes")
         .arg("-o")
-        .arg(format!("ConnectTimeout={}", timeout.as_secs().min(30)))
+        .arg(format!("ConnectTimeout={}", timeout.as_secs().min(30)));
+    if let Some(via) = via {
+        command.arg("-J").arg(via);
+    }
+    command
         .arg(host)
         // A login shell so nvm, Homebrew, and cargo are on PATH exactly as
         // they would be for the user.
@@ -296,13 +338,12 @@ struct Engines {
     llama_cpp: Option<String>,
 }
 
-fn deploy(host: &str, options: &Options) -> Result<String, String> {
+fn deploy(target: &Target, options: &Options) -> Result<String, String> {
     let mut report = String::new();
     let timeout = options.timeout;
 
     // ---- 1. Identify the host -------------------------------------------
-    let probe = ssh(
-        host,
+    let probe = target.run(
         "uname -s; uname -m; (sw_vers -productVersion 2>/dev/null || true)",
         timeout,
     )?;
@@ -322,11 +363,10 @@ fn deploy(host: &str, options: &Options) -> Result<String, String> {
     .ok();
 
     // ---- 2. Find a usable Node ------------------------------------------
-    let node = resolve_node(host, timeout, &mut report)?;
+    let node = resolve_node(target, timeout, &mut report)?;
 
     // ---- 3. Install or confirm Letta Code --------------------------------
-    let letta = ssh(
-        host,
+    let letta = target.run(
         &format!("{} letta --version 2>/dev/null || true", node.prefix),
         timeout,
     )?;
@@ -336,8 +376,7 @@ fn deploy(host: &str, options: &Options) -> Result<String, String> {
             writeln!(report, "  letta: WOULD INSTALL (@letta-ai/letta-code)").ok();
         } else {
             writeln!(report, "  letta: installing…").ok();
-            let install = ssh(
-                host,
+            let install = target.run(
                 &format!(
                     "{} npm install -g @letta-ai/letta-code 2>&1 | tail -3",
                     node.prefix
@@ -347,8 +386,7 @@ fn deploy(host: &str, options: &Options) -> Result<String, String> {
             if !install.ok() {
                 return Err(format!("npm install failed: {}", install.trimmed()));
             }
-            let check = ssh(
-                host,
+            let check = target.run(
                 &format!("{} letta --version 2>/dev/null || true", node.prefix),
                 timeout,
             )?;
@@ -364,8 +402,7 @@ fn deploy(host: &str, options: &Options) -> Result<String, String> {
     // ---- 4. Local backend ------------------------------------------------
     // Cloud is the default and needs an account; local keeps all state on the
     // host, which is the whole point of deploying it there.
-    let backend = ssh(
-        host,
+    let backend = target.run(
         &format!("{} letta backend 2>/dev/null || true", node.prefix),
         timeout,
     )?;
@@ -374,8 +411,7 @@ fn deploy(host: &str, options: &Options) -> Result<String, String> {
     } else if options.dry_run {
         writeln!(report, "  backend: WOULD SET to local").ok();
     } else {
-        let set = ssh(
-            host,
+        let set = target.run(
             &format!("{} letta backend local 2>&1 | tail -2", node.prefix),
             timeout,
         )?;
@@ -387,8 +423,7 @@ fn deploy(host: &str, options: &Options) -> Result<String, String> {
         }
         // Confirm by re-reading rather than trusting the write: a backend left
         // on Cloud needs an account, which defeats the deployment.
-        let confirm = ssh(
-            host,
+        let confirm = target.run(
             &format!("{} letta backend 2>/dev/null || true", node.prefix),
             timeout,
         )?;
@@ -403,19 +438,19 @@ fn deploy(host: &str, options: &Options) -> Result<String, String> {
     }
 
     // ---- 5. Local inference engines --------------------------------------
-    let engines = probe_engines(host, timeout, options)?;
+    let engines = probe_engines(target, timeout, options)?;
     report.push_str(&render_engines(&engines));
 
     if options.engine != Engine::None {
-        connect_engines(host, &node, &engines, options, timeout, &mut report)?;
+        connect_engines(target, &node, &engines, options, timeout, &mut report)?;
     }
 
     // ---- 6. Model suitability -------------------------------------------
-    report.push_str(&check_models(host, &engines, options, timeout)?);
+    report.push_str(&check_models(target, &engines, options, timeout)?);
 
     // ---- 7. Optional end-to-end turn ------------------------------------
     if options.verify && !options.dry_run {
-        report.push_str(&verify_turn(host, &node, options, timeout)?);
+        report.push_str(&verify_turn(target, &node, options, timeout)?);
     }
 
     Ok(report)
@@ -426,9 +461,9 @@ struct Node {
     prefix: String,
 }
 
-fn resolve_node(host: &str, timeout: Duration, report: &mut String) -> Result<Node, String> {
+fn resolve_node(target: &Target, timeout: Duration, report: &mut String) -> Result<Node, String> {
     // The default node first: if it is new enough, nothing else matters.
-    let default = ssh(host, "node --version 2>/dev/null || true", timeout)?;
+    let default = target.run("node --version 2>/dev/null || true", timeout)?;
     if let Some(version) = parse_node_version(default.trimmed()) {
         if node_is_new_enough(version) {
             writeln!(report, "  node: {}.{} (default)", version.0, version.1).ok();
@@ -439,8 +474,7 @@ fn resolve_node(host: &str, timeout: Duration, report: &mut String) -> Result<No
     }
 
     // Otherwise look for a new enough nvm install before suggesting one.
-    let listing = ssh(
-        host,
+    let listing = target.run(
         "ls ~/.nvm/versions/node 2>/dev/null | tr '\\n' ' ' || true",
         timeout,
     )?;
@@ -458,8 +492,9 @@ fn resolve_node(host: &str, timeout: Duration, report: &mut String) -> Result<No
 
     let found = default.trimmed();
     Err(format!(
-        "no Node >= {NODE_MIN_MAJOR}.{NODE_MIN_MINOR} on {host} ({}). Install one, \
+        "no Node >= {NODE_MIN_MAJOR}.{NODE_MIN_MINOR} on {} ({}). Install one, \
          e.g. `nvm install {NODE_MIN_MAJOR}` or `brew install node`, then re-run.",
+        target.host,
         if found.is_empty() {
             "node not found"
         } else {
@@ -468,12 +503,11 @@ fn resolve_node(host: &str, timeout: Duration, report: &mut String) -> Result<No
     ))
 }
 
-fn probe_engines(host: &str, timeout: Duration, options: &Options) -> Result<Engines, String> {
+fn probe_engines(target: &Target, timeout: Duration, options: &Options) -> Result<Engines, String> {
     let mut engines = Engines::default();
 
     if matches!(options.engine, Engine::Auto | Engine::Ollama) {
-        let tags = ssh(
-            host,
+        let tags = target.run(
             "curl -sf --max-time 5 http://127.0.0.1:11434/api/tags 2>/dev/null || true",
             timeout,
         )?;
@@ -484,8 +518,7 @@ fn probe_engines(host: &str, timeout: Duration, options: &Options) -> Result<Eng
             // the fix differs: start the service vs install it. The binary may
             // also sit in a prefix that a non-interactive shell does not
             // search, so look in the usual ones explicitly.
-            let binary = ssh(
-                host,
+            let binary = target.run(
                 "command -v ollama 2>/dev/null \
                  || ls /opt/homebrew/bin/ollama /usr/local/bin/ollama \
                        /snap/bin/ollama 2>/dev/null \
@@ -508,8 +541,7 @@ fn probe_engines(host: &str, timeout: Duration, options: &Options) -> Result<Eng
             ],
         };
         for url in candidates {
-            let probe = ssh(
-                host,
+            let probe = target.run(
                 &format!("curl -sf --max-time 5 {url}/models 2>/dev/null || true"),
                 timeout,
             )?;
@@ -576,7 +608,7 @@ fn render_engines(engines: &Engines) -> String {
 }
 
 fn connect_engines(
-    host: &str,
+    target: &Target,
     node: &Node,
     engines: &Engines,
     options: &Options,
@@ -589,8 +621,7 @@ fn connect_engines(
         if options.dry_run {
             writeln!(report, "  connect: WOULD connect ollama").ok();
         } else {
-            let out = ssh(
-                host,
+            let out = target.run(
                 &format!("{} letta connect ollama 2>&1 | tail -2", node.prefix),
                 timeout,
             )?;
@@ -604,8 +635,7 @@ fn connect_engines(
         } else {
             // The provider defaults to :8080, so a server anywhere else needs
             // the base URL passed explicitly.
-            let out = ssh(
-                host,
+            let out = target.run(
                 &format!(
                     "{} LLAMA_CPP_BASE_URL={url} letta connect llama-cpp 2>&1 | tail -2",
                     node.prefix
@@ -652,7 +682,7 @@ fn summarize(text: &str) -> String {
 /// agent rather than an error: a model without tool-call support, and a model
 /// served with too small a context for Letta's system prompt.
 fn check_models(
-    host: &str,
+    target: &Target,
     engines: &Engines,
     options: &Options,
     timeout: Duration,
@@ -674,8 +704,7 @@ fn check_models(
     let mut capable = Vec::new();
     let mut incapable = Vec::new();
     for name in models {
-        let show = ssh(
-            host,
+        let show = target.run(
             &format!(
                 "curl -sf --max-time 10 http://127.0.0.1:11434/api/show \
                  -d '{{\"name\":\"{name}\"}}' 2>/dev/null || true"
@@ -737,7 +766,7 @@ fn capabilities_include_tools(body: &str) -> bool {
 
 /// Run one real agent turn, the only check that proves the host can serve.
 fn verify_turn(
-    host: &str,
+    target: &Target,
     node: &Node,
     options: &Options,
     timeout: Duration,
@@ -753,8 +782,7 @@ fn verify_turn(
     };
 
     writeln!(out, "  verify: running one turn on {model}…").ok();
-    let turn = ssh(
-        host,
+    let turn = target.run(
         &format!(
             "{} letta -p 'Reply with exactly: LOCAL OK' --model {model} \
              --output-format text 2>&1 | tail -6",
@@ -919,6 +947,25 @@ mod tests {
         // The confirmation printed right after switching.
         assert!(backend_is_local("Default backend set to local mode."));
         assert!(!backend_is_local(""));
+    }
+
+    #[test]
+    fn accepts_a_jump_host() {
+        let options = parse_args(
+            ["amd", "--via", "studio"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(options.hosts, ["amd"]);
+        assert_eq!(options.via.as_deref(), Some("studio"));
+
+        // Absent by default, and the flag needs a value.
+        let plain = parse_args(vec!["amd".to_owned()]).unwrap().unwrap();
+        assert_eq!(plain.via, None);
+        assert!(parse_args(vec!["amd".to_owned(), "--via".to_owned()]).is_err());
     }
 
     #[test]
