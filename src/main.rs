@@ -1,0 +1,263 @@
+//! `herdr-infinity` — native Herdr integration for Infinity Code.
+//!
+//! Infinity Code already separates the agent from its terminal UI: every turn
+//! lives in the long-running Infinity daemon, and the TUI is just a client.
+//! That makes a faithful Herdr integration possible without patching Infinity:
+//! we run the TUI unchanged and observe the daemon's `SessionsUpdated`
+//! broadcasts on the side, translating `Running`/`Idle`/`WaitingForChoice`
+//! into Herdr's `working`/`idle`/`blocked` states.
+//!
+//! The wrapper is deliberately a shim around the real `infinity` binary. It
+//! never edits Infinity's files and never changes the agent's behaviour.
+
+mod herdr;
+mod infinity;
+mod shim;
+
+use std::path::PathBuf;
+use std::process::{Command, ExitCode};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::time::Duration;
+
+use herdr::Reporter;
+use infinity::BridgeOptions;
+
+const USAGE: &str = "\
+herdr-infinity — native Herdr integration for Infinity Code
+
+Usage:
+  herdr-infinity run [--] [infinity arguments...]
+      Run Infinity in this pane and report idle/working/blocked to Herdr.
+      Outside Herdr this simply execs the real `infinity` binary.
+
+  herdr-infinity doctor
+      Print what the integration can see (Herdr env, Infinity binary,
+      daemon socket, known sessions).
+
+  herdr-infinity install-shim [--dir <dir>] [--force]
+      Install an `infinity` shim that routes through herdr-infinity.
+      Default directory: ~/.local/share/herdr-infinity/bin
+
+  herdr-infinity uninstall-shim [--dir <dir>]
+      Remove a shim installed by this tool.
+
+  herdr-infinity version
+  herdr-infinity --help
+
+Environment:
+  INFINITY_BIN   Path to the real Infinity binary (default: search PATH)
+  HERDR_ENV, HERDR_PANE_ID, HERDR_BIN_PATH
+                 Injected by Herdr; reporting is disabled without them.
+";
+
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match dispatch(args) {
+        Ok(code) => code,
+        Err(err) => {
+            eprintln!("herdr-infinity: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn dispatch(args: Vec<String>) -> Result<ExitCode, String> {
+    match args.first().map(String::as_str) {
+        None | Some("-h") | Some("--help") | Some("help") => {
+            print!("{USAGE}");
+            Ok(ExitCode::SUCCESS)
+        }
+        Some("-V") | Some("--version") | Some("version") => {
+            println!("herdr-infinity {}", env!("CARGO_PKG_VERSION"));
+            Ok(ExitCode::SUCCESS)
+        }
+        Some("run") => cmd_run(args[1..].to_vec()),
+        Some("doctor") => cmd_doctor(),
+        Some("install-shim") => cmd_install_shim(&args[1..]),
+        Some("uninstall-shim") => cmd_uninstall_shim(&args[1..]),
+        Some(other) => Err(format!("unknown command {other:?}; try --help")),
+    }
+}
+
+fn cmd_run(mut args: Vec<String>) -> Result<ExitCode, String> {
+    if args.first().map(String::as_str) == Some("--") {
+        args.remove(0);
+    }
+
+    let real = shim::find_infinity()?;
+
+    // Outside Herdr there is nothing to report to: hand the terminal over to
+    // the real binary with exec so signals and the TTY behave exactly as
+    // before.
+    if !herdr::active() {
+        use std::os::unix::process::CommandExt;
+        let error = Command::new(&real).args(&args).exec();
+        return Err(format!("failed to exec {}: {error}", real.display()));
+    }
+
+    let pane_cwd = std::env::current_dir()
+        .map_err(|error| format!("cannot read current directory: {error}"))?;
+    let explicit = infinity::session_prefix_from_args(&args);
+    let follow_after_exit = args.iter().any(|arg| arg == "-H" || arg == "--headless");
+    let local = args.iter().any(|arg| arg == "--local" || arg == "-l");
+
+    if local {
+        eprintln!(
+            "herdr-infinity: --local keeps the agent in this process; Herdr state \
+             reporting is unavailable in that mode"
+        );
+    }
+
+    let baseline = infinity::read_store_sessions();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    for signal in [
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGHUP,
+    ] {
+        // SIG_IGN would be inherited across exec and break Ctrl-C for the TUI;
+        // a flag handler is reset to SIG_DFL by exec, so the child is unaffected.
+        let _ = signal_hook::flag::register(signal, Arc::clone(&stop));
+    }
+
+    let reporter = Reporter::new();
+    let mut child = Command::new(&real)
+        .args(&args)
+        .spawn()
+        .map_err(|error| format!("failed to start {}: {error}", real.display()))?;
+
+    let options = BridgeOptions {
+        explicit,
+        pane_cwd,
+        baseline,
+        follow_after_exit,
+        local,
+    };
+    let status = infinity::bridge(options, &reporter, &mut child, &stop);
+
+    reporter.release();
+    reporter.flush(Duration::from_secs(2));
+
+    match status {
+        Some(status) => Ok(ExitCode::from(exit_code(status))),
+        None => Ok(ExitCode::FAILURE),
+    }
+}
+
+fn exit_code(status: std::process::ExitStatus) -> u8 {
+    use std::os::unix::process::ExitStatusExt;
+    match status.code() {
+        Some(code) => code as u8,
+        None => 128u8.saturating_add(status.signal().unwrap_or(0) as u8),
+    }
+}
+
+fn cmd_doctor() -> Result<ExitCode, String> {
+    println!("herdr active: {}", herdr::active());
+    println!(
+        "  HERDR_ENV={:?} HERDR_PANE_ID={:?}",
+        std::env::var("HERDR_ENV").ok(),
+        std::env::var("HERDR_PANE_ID").ok()
+    );
+    println!(
+        "  HERDR_BIN_PATH={:?}",
+        std::env::var("HERDR_BIN_PATH").ok()
+    );
+
+    match shim::find_infinity() {
+        Ok(path) => println!("infinity binary: {}", path.display()),
+        Err(error) => println!("infinity binary: NOT FOUND ({error})"),
+    }
+
+    let socket = home_dir().join(".infinity").join("daemon.sock");
+    println!(
+        "infinity daemon socket: {} (exists: {})",
+        socket.display(),
+        socket.exists()
+    );
+
+    let store = infinity::read_store_sessions();
+    println!("known sessions: {}", store.len());
+    let mut entries: Vec<_> = store.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    for (id, entry) in entries.into_iter().take(20) {
+        println!(
+            "  {id}  cwd={}  idle={}  shut_down={}  archived={}",
+            entry.cwd.display(),
+            entry.idle,
+            entry.shut_down,
+            entry.archived
+        );
+    }
+
+    println!(
+        "current directory: {}",
+        std::env::current_dir()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|error| format!("<error: {error}>"))
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_install_shim(args: &[String]) -> Result<ExitCode, String> {
+    let mut dir: Option<PathBuf> = None;
+    let mut force = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--dir" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--dir needs a path".to_owned())?;
+                dir = Some(PathBuf::from(value));
+                index += 2;
+            }
+            "--force" | "-f" => {
+                force = true;
+                index += 1;
+            }
+            other => return Err(format!("unexpected argument {other:?} for install-shim")),
+        }
+    }
+
+    let path = shim::install_shim(dir, force)?;
+    println!("installed shim: {}", path.display());
+    println!(
+        "put {} before the real infinity binary on PATH, e.g.:",
+        path.parent().unwrap_or(&path).display()
+    );
+    println!(
+        "  export PATH=\"{}:$PATH\"",
+        path.parent().unwrap_or(&path).display()
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_uninstall_shim(args: &[String]) -> Result<ExitCode, String> {
+    let mut dir: Option<PathBuf> = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--dir" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--dir needs a path".to_owned())?;
+                dir = Some(PathBuf::from(value));
+                index += 2;
+            }
+            other => return Err(format!("unexpected argument {other:?} for uninstall-shim")),
+        }
+    }
+
+    let path = shim::uninstall_shim(dir)?;
+    println!("removed shim: {}", path.display());
+    Ok(ExitCode::SUCCESS)
+}
+
+pub(crate) fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"))
+}
