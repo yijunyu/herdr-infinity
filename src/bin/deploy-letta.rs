@@ -536,16 +536,24 @@ fn probe_engines(target: &Target, timeout: Duration, options: &Options) -> Resul
         let candidates: Vec<String> = match &options.llama_cpp_url {
             Some(url) => vec![url.clone()],
             None => vec![
+                // The conventional port, then the ones this project has met
+                // in practice. A server behind an API key answers /models
+                // with 401, which still proves something is listening.
                 "http://127.0.0.1:8080/v1".to_owned(),
+                "http://127.0.0.1:8000/v1".to_owned(),
                 "http://127.0.0.1:18081/v1".to_owned(),
             ],
         };
         for url in candidates {
             let probe = target.run(
-                &format!("curl -sf --max-time 5 {url}/models 2>/dev/null || true"),
+                &format!(
+                    "curl -s -o /dev/null -w '%{{http_code}}' --max-time 5 \
+                     {url}/models 2>/dev/null || true"
+                ),
                 timeout,
             )?;
-            if !probe.trimmed().is_empty() {
+            // 200 means open; 401/403 means a server is there but wants a key.
+            if matches!(probe.trimmed(), "200" | "401" | "403") {
                 engines.llama_cpp = Some(url);
                 break;
             }
