@@ -240,14 +240,56 @@ $ letta -p "Reply with exactly: LOCAL OK" --model ollama/qwen2.5-coder-32k
 LOCAL OK
 ```
 
+An AMD host (Ryzen AI Max+ 395 / Radeon 8060S, 122 GB) answered too, against a
+`llama-server` already running there with a 131k context:
+
+```console
+$ letta -p "Reply with exactly: LOCAL OK" \
+    --model llama.cpp/minicpm-v4.7-35b-a3b-q4km
+LOCAL OK
+```
+
+Reusing a running server is usually the better move on a shared box: a second
+model competes for the same VRAM. Note that a server can support tool calls
+without advertising them — that one reports capabilities
+`["completion","multimodal"]` with no `"tools"`, yet returns structured
+`tool_calls` because it runs with `--jinja`. Ask it rather than trusting the
+capability list:
+
+```sh
+curl -s $BASE/chat/completions -H "Authorization: Bearer $KEY" \
+  -d '{"model":"...","messages":[{"role":"user","content":"2+2? use calc"}],
+       "tools":[{"type":"function","function":{"name":"calc",
+       "parameters":{"type":"object","properties":{"e":{"type":"string"}}}}}]}'
+```
+
 To diagnose a silent turn, read
 `~/.letta/lc-local-backend/conversations/<id>/messages.jsonl`: a user message
 with no assistant entry means the model never produced one. That is the
-difference between the two hosts — the CPU box recorded only the user message,
-the Apple Silicon box recorded `assistant -> LOCAL OK`.
+difference between the hosts — the CPU box recorded only the user message;
+both GPU hosts recorded `assistant -> LOCAL OK`.
 
 None of this affects the memory bridge, which reads and writes files and does
 not care which model — or whether any model — produced them.
+
+#### Herdr does not see a Letta pane (0.9.1)
+
+Letta runs fine; its Herdr *pane* integration does not. A pane running Letta
+Code 0.34.31 reports `agent: None, status: unknown` and never appears in
+`herdr agent list`, although `letta` is a valid `agent start --kind` value and
+`herdr integration install letta` reports `current (v1)`.
+
+The installed hook cannot fix this: it calls `pane report-agent-session`,
+which attaches a session id to an agent Herdr has *already* identified. A
+direct `pane report-agent --agent letta` exits 0 and changes nothing, so an
+unrecognised pane cannot be claimed from outside. The cause is identification
+rather than state rules — Herdr exposes no process command for the pane, only
+`terminal_title`, which Letta sets to the agent's name, and the process itself
+is `node`. A local `~/.config/herdr/agent-detection/letta.toml` override loads
+with no diagnostics and still does not produce detection.
+
+The mechanism that does work is the one this project uses for Infinity: a
+resident wrapper that reports its own state through `pane report-agent`.
 
 ## Commands
 
