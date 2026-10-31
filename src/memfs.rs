@@ -32,6 +32,12 @@ pub struct Memo {
     /// Claude Code's `metadata.type`. MemFS has no equivalent, so a memo
     /// imported from MemFS gets `reference`.
     pub kind: String,
+    /// Whether `kind` came from the file or is the fallback.
+    ///
+    /// A type filter must not match a memo that never declared a type:
+    /// defaulting to `reference` and then filtering on `reference` would
+    /// select every untyped memory in a project.
+    pub kind_declared: bool,
     /// Everything after the frontmatter.
     pub body: String,
 }
@@ -71,7 +77,46 @@ impl Memo {
             .next()
             .unwrap_or(&self.description);
         let title = title_from_name(&self.name);
-        format!("- [{}]({}.md) — {}", title, self.name, hook.trim())
+        format!(
+            "- [{}]({}.md) — {}",
+            title,
+            file_stem(&self.name),
+            hook.trim()
+        )
+    }
+}
+
+/// Turn a memo name into a safe file stem.
+///
+/// A `name` is free text — Claude Code memories in the wild carry whole
+/// sentences, with `/`, em dashes and punctuation — so it cannot be used as a
+/// filename directly: a `/` makes the write fail with ENOENT against a
+/// directory that does not exist. Lowercase alphanumerics and single hyphens
+/// survive; everything else collapses to a hyphen.
+pub fn file_stem(name: &str) -> String {
+    let mut stem = String::with_capacity(name.len());
+    let mut pending_hyphen = false;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if pending_hyphen && !stem.is_empty() {
+                stem.push('-');
+            }
+            pending_hyphen = false;
+            stem.push(ch.to_ascii_lowercase());
+        } else if ch == '.' && !stem.is_empty() {
+            // Keep dots inside words (e.g. a version), but never a leading one.
+            stem.push('.');
+            pending_hyphen = false;
+        } else {
+            pending_hyphen = true;
+        }
+    }
+    // A name of only punctuation would otherwise yield an empty filename.
+    let stem = stem.trim_matches(|c| c == '-' || c == '.').to_owned();
+    if stem.is_empty() {
+        "memo".to_owned()
+    } else {
+        stem
     }
 }
 
@@ -156,11 +201,12 @@ fn frontmatter_field(frontmatter: &str, key: &str) -> Option<String> {
 pub fn parse_memo(stem: &str, contents: &str) -> Option<Memo> {
     let (frontmatter, body) = split_frontmatter(contents)?;
     let description = frontmatter_field(frontmatter, "description")?;
+    let declared = frontmatter_field(frontmatter, "metadata.type");
     Some(Memo {
         name: frontmatter_field(frontmatter, "name").unwrap_or_else(|| stem.to_owned()),
         description,
-        kind: frontmatter_field(frontmatter, "metadata.type")
-            .unwrap_or_else(|| "reference".to_owned()),
+        kind_declared: declared.is_some(),
+        kind: declared.unwrap_or_else(|| "reference".to_owned()),
         body: body.trim_start_matches('\n').to_owned(),
     })
 }
@@ -333,6 +379,30 @@ fn write_index(dir: &Path, memos: &BTreeMap<String, Memo>) -> Result<(), String>
     std::fs::write(&path, body).map_err(|error| format!("cannot write {}: {error}", path.display()))
 }
 
+/// Which memories to copy.
+///
+/// Seeding a Letta agent is budget-constrained in a way Claude Code is not:
+/// MemFS renders every root file into the agent's context on every turn, and
+/// `MEMORY.md` indexes nothing, so a project with hundreds of memories cannot
+/// be exported wholesale. Filtering by `metadata.type` is the useful cut —
+/// `feedback` and `reference` hold durable guidance, while `project` and
+/// `memory` are mostly dated status snapshots.
+#[derive(Debug, Clone, Default)]
+pub struct Filter {
+    /// Keep only these `metadata.type` values. Empty keeps everything.
+    pub types: Vec<String>,
+}
+
+impl Filter {
+    pub fn keeps(&self, memo: &Memo) -> bool {
+        if self.types.is_empty() {
+            return true;
+        }
+        // Only an explicitly declared type can match.
+        memo.kind_declared && self.types.iter().any(|t| t == &memo.kind)
+    }
+}
+
 /// Copy memory from one side to the other.
 ///
 /// Returns the plan that was applied (or, with `dry_run`, would have been).
@@ -342,6 +412,23 @@ pub fn sync(
     direction: Direction,
     dry_run: bool,
 ) -> Result<Plan, String> {
+    sync_filtered(
+        memfs_dir,
+        claude_dir,
+        direction,
+        dry_run,
+        &Filter::default(),
+    )
+}
+
+/// `sync`, keeping only the memories a filter accepts.
+pub fn sync_filtered(
+    memfs_dir: &Path,
+    claude_dir: &Path,
+    direction: Direction,
+    dry_run: bool,
+    filter: &Filter,
+) -> Result<Plan, String> {
     let system = memfs_system_dir(memfs_dir);
     let memfs = read_dir(&system)?;
     let claude = read_dir(claude_dir)?;
@@ -350,6 +437,13 @@ pub fn sync(
         Direction::Import => (&memfs, &claude, claude_dir.to_path_buf()),
         Direction::Export => (&claude, &memfs, system.clone()),
     };
+
+    let selected: BTreeMap<String, Memo> = source
+        .iter()
+        .filter(|(_, memo)| filter.keeps(memo))
+        .map(|(name, memo)| (name.clone(), memo.clone()))
+        .collect();
+    let source = &selected;
 
     let plan = plan(source, target);
     if dry_run || plan.is_empty() {
@@ -363,7 +457,7 @@ pub fn sync(
         let memo = source
             .get(change.name())
             .ok_or_else(|| format!("internal error: {} vanished", change.name()))?;
-        let path = target_dir.join(format!("{}.md", memo.name));
+        let path = target_dir.join(format!("{}.md", file_stem(&memo.name)));
         let rendered = match direction {
             Direction::Import => memo.to_claude(),
             Direction::Export => memo.to_memfs(),
@@ -502,6 +596,7 @@ Herdr runs plugin commands with the server's PATH.
         let memo = Memo {
             name: "letta-memfs-is-plain-git-markdown".to_owned(),
             description: "Short hook — and a longer tail that should be dropped.".to_owned(),
+            kind_declared: true,
             kind: "reference".to_owned(),
             body: "body".to_owned(),
         };
@@ -520,6 +615,7 @@ Herdr runs plugin commands with the server's PATH.
             Memo {
                 name: "same".to_owned(),
                 description: "d".to_owned(),
+                kind_declared: true,
                 kind: "reference".to_owned(),
                 body: "b".to_owned(),
             },
@@ -529,6 +625,7 @@ Herdr runs plugin commands with the server's PATH.
             Memo {
                 name: "changed".to_owned(),
                 description: "new".to_owned(),
+                kind_declared: true,
                 kind: "reference".to_owned(),
                 body: "b".to_owned(),
             },
@@ -538,6 +635,7 @@ Herdr runs plugin commands with the server's PATH.
             Memo {
                 name: "fresh".to_owned(),
                 description: "d".to_owned(),
+                kind_declared: true,
                 kind: "reference".to_owned(),
                 body: "b".to_owned(),
             },
@@ -549,6 +647,7 @@ Herdr runs plugin commands with the server's PATH.
             Memo {
                 name: "same".to_owned(),
                 description: "d".to_owned(),
+                kind_declared: true,
                 // A differing kind alone must not count as a change: MemFS
                 // cannot represent it.
                 kind: "project".to_owned(),
@@ -560,6 +659,7 @@ Herdr runs plugin commands with the server's PATH.
             Memo {
                 name: "changed".to_owned(),
                 description: "old".to_owned(),
+                kind_declared: true,
                 kind: "reference".to_owned(),
                 body: "b".to_owned(),
             },
@@ -709,7 +809,9 @@ Not a questionnaire.
         // The frontmatter `name` is the identity, not the file stem.
         assert_eq!(plan.changes, [Change::Create("Human".to_owned())]);
 
-        let written = std::fs::read_to_string(claude.join("Human.md")).unwrap();
+        // The file stem is slugified; `name` keeps its original casing, which
+        // is Letta's own convention (`human.md` carrying `name: Human`).
+        let written = std::fs::read_to_string(claude.join("human.md")).unwrap();
         assert!(written.contains("name: Human"));
         // MemFS carries no type, so the import defaults it.
         assert!(written.contains("type: reference"));
@@ -718,6 +820,100 @@ Not a questionnaire.
         let back = sync(&memory, &claude, Direction::Export, false).unwrap();
         assert!(back.is_empty(), "{:?}", back.changes);
         assert!(!memory.join("system").exists());
+    }
+
+    #[test]
+    fn a_filter_never_matches_an_undeclared_type() {
+        // The real failure: 141 of ase2026c's memories declare no
+        // metadata.type. Defaulting them to `reference` and then filtering on
+        // `reference` selected 164 files instead of 24.
+        let untyped = parse_memo("x", "---\nname: x\ndescription: d\n---\n\nbody\n").unwrap();
+        assert_eq!(untyped.kind, "reference", "the default still applies");
+        assert!(!untyped.kind_declared);
+
+        let filter = Filter {
+            types: vec!["reference".to_owned()],
+        };
+        assert!(!filter.keeps(&untyped), "an undeclared type must not match");
+
+        let typed = parse_memo(
+            "y",
+            "---\nname: y\ndescription: d\nmetadata:\n  type: reference\n---\n\nbody\n",
+        )
+        .unwrap();
+        assert!(typed.kind_declared);
+        assert!(filter.keeps(&typed));
+        // No filter keeps everything, declared or not.
+        assert!(Filter::default().keeps(&untyped));
+    }
+
+    #[test]
+    fn file_stems_are_safe_for_any_name() {
+        // The real case that broke a seed: a sentence with a slash.
+        assert_eq!(
+            file_stem("168.9 tok/s paper claim — full provenance on branch 910c"),
+            "168.9-tok-s-paper-claim-full-provenance-on-branch-910c"
+        );
+        assert_eq!(file_stem("already-a-slug"), "already-a-slug");
+        assert_eq!(file_stem("Mixed Case Name"), "mixed-case-name");
+        // No path traversal can survive.
+        assert_eq!(file_stem("../../etc/passwd"), "etc-passwd");
+        assert!(!file_stem("a/b").contains('/'));
+        // Punctuation-only names still produce a usable filename.
+        assert_eq!(file_stem("///"), "memo");
+        assert_eq!(file_stem(""), "memo");
+        // No leading or trailing separators.
+        let stem = file_stem("  -- hello --  ");
+        assert_eq!(stem, "hello");
+    }
+
+    #[test]
+    fn a_type_filter_selects_what_to_seed() {
+        let root = tempfile::tempdir().unwrap();
+        let claude = root.path().join("claude");
+        let memfs = root.path().join("memfs");
+        std::fs::create_dir_all(&claude).unwrap();
+        for (name, kind) in [
+            ("guidance", "feedback"),
+            ("pointer", "reference"),
+            ("status", "project"),
+        ] {
+            std::fs::write(
+                claude.join(format!("{name}.md")),
+                format!(
+                    "---\nname: {name}\ndescription: d\nmetadata:\n  type: {kind}\n---\n\nbody\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        let filter = Filter {
+            types: vec!["feedback".to_owned(), "reference".to_owned()],
+        };
+        let plan = sync_filtered(&memfs, &claude, Direction::Export, false, &filter).unwrap();
+        let mut names: Vec<&str> = plan.changes.iter().map(Change::name).collect();
+        names.sort();
+        assert_eq!(names, ["guidance", "pointer"]);
+        // The excluded type must not reach MemFS at all.
+        assert!(!memfs.join("system/status.md").exists());
+        assert!(!memfs.join("status.md").exists());
+    }
+
+    #[test]
+    fn an_empty_filter_keeps_everything() {
+        let filter = Filter::default();
+        let memo = Memo {
+            name: "x".to_owned(),
+            description: "d".to_owned(),
+            kind_declared: true,
+            kind: "project".to_owned(),
+            body: "b".to_owned(),
+        };
+        assert!(filter.keeps(&memo));
+        let narrow = Filter {
+            types: vec!["feedback".to_owned()],
+        };
+        assert!(!narrow.keeps(&memo));
     }
 
     #[test]

@@ -47,6 +47,10 @@ Usage:
         --claude-dir <dir>  Claude Code memory dir (default: derived
                             from the current project path)
         --dry-run           Show the plan without writing
+        --only-types <list> Copy only these metadata.type values, e.g.
+                            feedback,reference. MemFS renders every file
+                            into the agent's context each turn, so a large
+                            project must be seeded selectively.
 
   herdr-infinity doctor
       Print what the integration can see (Herdr env, Infinity binary,
@@ -242,6 +246,7 @@ fn cmd_memfs(args: &[String]) -> Result<ExitCode, String> {
     let mut memory_dir: Option<PathBuf> = None;
     let mut claude_dir: Option<PathBuf> = None;
     let mut dry_run = false;
+    let mut types: Vec<String> = Vec::new();
     let mut mode: Option<&str> = None;
 
     let mut index = 0;
@@ -264,6 +269,18 @@ fn cmd_memfs(args: &[String]) -> Result<ExitCode, String> {
             "--dry-run" | "-n" => {
                 dry_run = true;
                 index += 1;
+            }
+            "--only-types" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--only-types needs a comma-separated list".to_owned())?;
+                types = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                index += 2;
             }
             other if other.starts_with('-') => {
                 return Err(format!("unexpected argument {other:?} for memfs"))
@@ -303,7 +320,8 @@ fn cmd_memfs(args: &[String]) -> Result<ExitCode, String> {
             } else {
                 memfs::Direction::Export
             };
-            let plan = memfs::sync(&memfs_dir, &claude_dir, direction, dry_run)?;
+            let filter = memfs::Filter { types };
+            let plan = memfs::sync_filtered(&memfs_dir, &claude_dir, direction, dry_run, &filter)?;
             print!("{}", plan.render(direction));
             if dry_run && !plan.is_empty() {
                 println!("(dry run: nothing was written)");
