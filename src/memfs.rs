@@ -379,6 +379,81 @@ fn write_index(dir: &Path, memos: &BTreeMap<String, Memo>) -> Result<(), String>
     std::fs::write(&path, body).map_err(|error| format!("cannot write {}: {error}", path.display()))
 }
 
+/// Export memories into an indexed child directory instead of the root.
+///
+/// Root Markdown files *are* the agent's system prompt: Letta renders every
+/// one into context on each turn, and its own guidance is to keep them lean —
+/// "compact indexes and behavioral rules over bulk content", with detail moved
+/// to indexed child directories. Seeding a project's accumulated memories into
+/// the root therefore spends the agent's permanent context budget before it has
+/// learned anything.
+///
+/// A child directory counts as memory only when it holds its own
+/// frontmatter-free `MEMORY.md`; every other file in it carries exactly `name`
+/// and `description`. This writes that shape, so the agent discovers the facts
+/// through the index rather than carrying them all in its prompt.
+pub fn export_indexed(
+    memfs_dir: &Path,
+    claude_dir: &Path,
+    subdir: &str,
+    filter: &Filter,
+    dry_run: bool,
+) -> Result<Plan, String> {
+    if subdir.is_empty() || subdir.contains('/') || subdir.starts_with('.') {
+        return Err(format!(
+            "invalid memory subdirectory {subdir:?}: use a single plain name"
+        ));
+    }
+
+    let source = read_dir(claude_dir)?;
+    let target_dir = memfs_dir.join(subdir);
+    let target = read_dir(&target_dir)?;
+
+    let selected: BTreeMap<String, Memo> = source
+        .iter()
+        .filter(|(_, memo)| filter.keeps(memo))
+        .map(|(name, memo)| (name.clone(), memo.clone()))
+        .collect();
+
+    let plan = plan(&selected, &target);
+    if dry_run || plan.is_empty() {
+        return Ok(plan);
+    }
+
+    std::fs::create_dir_all(&target_dir)
+        .map_err(|error| format!("cannot create {}: {error}", target_dir.display()))?;
+
+    for change in &plan.changes {
+        let memo = selected
+            .get(change.name())
+            .ok_or_else(|| format!("internal error: {} vanished", change.name()))?;
+        let path = target_dir.join(format!("{}.md", file_stem(&memo.name)));
+        std::fs::write(&path, memo.to_memfs())
+            .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+    }
+
+    // The child directory is only recognised as memory once it has its own
+    // frontmatter-free index.
+    let merged = read_dir(&target_dir)?;
+    write_child_index(&target_dir, subdir, &merged)?;
+    Ok(plan)
+}
+
+/// Write a child directory's frontmatter-free `MEMORY.md`.
+fn write_child_index(
+    dir: &Path,
+    subdir: &str,
+    memos: &BTreeMap<String, Memo>,
+) -> Result<(), String> {
+    let mut body = format!("# {subdir}\n\n");
+    for memo in memos.values() {
+        body.push_str(&memo.index_line());
+        body.push('\n');
+    }
+    let path = dir.join("MEMORY.md");
+    std::fs::write(&path, body).map_err(|error| format!("cannot write {}: {error}", path.display()))
+}
+
 /// Which memories to copy.
 ///
 /// Seeding a Letta agent is budget-constrained in a way Claude Code is not:
@@ -820,6 +895,50 @@ Not a questionnaire.
         let back = sync(&memory, &claude, Direction::Export, false).unwrap();
         assert!(back.is_empty(), "{:?}", back.changes);
         assert!(!memory.join("system").exists());
+    }
+
+    #[test]
+    fn exports_into_an_indexed_child_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let claude = root.path().join("claude");
+        let memfs = root.path().join("memfs");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(claude.join("a.md"), CLAUDE_FILE).unwrap();
+
+        let plan = export_indexed(&memfs, &claude, "project", &Filter::default(), false).unwrap();
+        assert_eq!(plan.changes.len(), 1);
+
+        // The facts land in the child directory, not the root, so they stay
+        // out of the agent's system prompt.
+        let child = memfs.join("project");
+        assert!(child.join("plugin-path.md").exists());
+        assert!(!memfs.join("plugin-path.md").exists());
+
+        // A child directory is memory only with its own frontmatter-free index.
+        let index = std::fs::read_to_string(child.join("MEMORY.md")).unwrap();
+        assert!(!index.starts_with("---"), "index must have no frontmatter");
+        assert!(index.contains("(plugin-path.md)"));
+
+        // Files in it carry exactly name and description.
+        let written = std::fs::read_to_string(child.join("plugin-path.md")).unwrap();
+        assert!(written.contains("name: plugin-path"));
+        assert!(written.contains("description:"));
+        assert!(!written.contains("metadata"));
+
+        // Re-running settles.
+        let again = export_indexed(&memfs, &claude, "project", &Filter::default(), false).unwrap();
+        assert!(again.is_empty(), "{:?}", again.changes);
+    }
+
+    #[test]
+    fn rejects_an_unsafe_subdirectory() {
+        let root = tempfile::tempdir().unwrap();
+        for bad in ["", "a/b", "../escape", ".hidden"] {
+            assert!(
+                export_indexed(root.path(), root.path(), bad, &Filter::default(), true).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
     }
 
     #[test]

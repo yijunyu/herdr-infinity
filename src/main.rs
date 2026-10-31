@@ -47,6 +47,10 @@ Usage:
         --claude-dir <dir>  Claude Code memory dir (default: derived
                             from the current project path)
         --dry-run           Show the plan without writing
+        --into <dir>        Export into an indexed child directory rather
+                            than the memory root. Root files are the
+                            agent's system prompt, so bulk facts belong in
+                            a child directory with its own MEMORY.md.
         --only-types <list> Copy only these metadata.type values, e.g.
                             feedback,reference. MemFS renders every file
                             into the agent's context each turn, so a large
@@ -247,6 +251,7 @@ fn cmd_memfs(args: &[String]) -> Result<ExitCode, String> {
     let mut claude_dir: Option<PathBuf> = None;
     let mut dry_run = false;
     let mut types: Vec<String> = Vec::new();
+    let mut subdir: Option<String> = None;
     let mut mode: Option<&str> = None;
 
     let mut index = 0;
@@ -269,6 +274,13 @@ fn cmd_memfs(args: &[String]) -> Result<ExitCode, String> {
             "--dry-run" | "-n" => {
                 dry_run = true;
                 index += 1;
+            }
+            "--into" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--into needs a directory name".to_owned())?;
+                subdir = Some(value.to_owned());
+                index += 2;
             }
             "--only-types" => {
                 let value = args
@@ -321,7 +333,19 @@ fn cmd_memfs(args: &[String]) -> Result<ExitCode, String> {
                 memfs::Direction::Export
             };
             let filter = memfs::Filter { types };
-            let plan = memfs::sync_filtered(&memfs_dir, &claude_dir, direction, dry_run, &filter)?;
+            let plan = match (&subdir, direction) {
+                // An indexed child directory keeps the agent's root — its
+                // system prompt — lean.
+                (Some(subdir), memfs::Direction::Export) => {
+                    memfs::export_indexed(&memfs_dir, &claude_dir, subdir, &filter, dry_run)?
+                }
+                (Some(_), memfs::Direction::Import) => {
+                    return Err("--into applies to export only".to_owned())
+                }
+                (None, _) => {
+                    memfs::sync_filtered(&memfs_dir, &claude_dir, direction, dry_run, &filter)?
+                }
+            };
             print!("{}", plan.render(direction));
             if dry_run && !plan.is_empty() {
                 println!("(dry run: nothing was written)");
