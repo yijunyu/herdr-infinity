@@ -20,4 +20,7 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all-targets
-      - run: shellcheck plugin/run.sh
+      # Fail on real defects; style and info notes are advisory. Without a
+      # severity floor an informational note (e.g. SC2016 on intentional
+      # single quotes) fails the build.
+      - run: shellcheck --severity=warning plugin/run.sh

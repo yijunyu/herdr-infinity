@@ -11,9 +11,11 @@
 # checkout), then the usual install prefixes, then PATH as a last resort.
 set -eu
 
-# `env -u CDPATH` rather than `CDPATH= cd`: both stop a stray CDPATH sending
-# cd somewhere else, but shellcheck reads the latter as a typo (SC1007).
-root="${HERDR_PLUGIN_ROOT:-$(env -u CDPATH sh -c 'cd -- "$(dirname -- "$1")/.." && pwd' _ "$0")}"
+# Derive the plugin root from this script's own location when Herdr has not
+# supplied it. `dirname` twice avoids `cd`, so a stray CDPATH cannot interfere
+# and the path needs no subshell gymnastics.
+self_dir=$(dirname -- "$0")
+root="${HERDR_PLUGIN_ROOT:-$(dirname -- "$self_dir")}"
 
 candidates="
 ${HERDR_INFINITY_BIN:-}
