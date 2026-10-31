@@ -155,6 +155,27 @@ project path. Syncing is always explicit — memory steers an agent's behaviour
 for a long time, so nothing is written on a timer or behind your back, and
 `--dry-run` shows the plan first.
 
+`--into <dir>` exports into an indexed child directory instead of the root.
+Root Markdown files are the agent's system prompt, loaded into its context
+every turn, and Letta's own prompt asks for core memory to stay lean: compact
+indexes and behavioural rules, with the detail in indexed child directories.
+Seeding a project's accumulated memories into the root therefore spends the
+agent's permanent context budget before it has learned anything — one agent
+landed at 77% of the 65536-char cap. `--into project` writes
+`<memory>/project/*.md` plus that directory's own MEMORY.md, which is what
+makes a child directory count as memory at all; root then stays near 1% of the
+cap. The directory name is validated, so a path or a dotfile cannot be used,
+and the flag applies to `export` only.
+
+`--only-types <list>` copies only the memories whose `metadata.type` is in the
+list, e.g. `--only-types feedback,reference`. MemFS renders every file it holds
+into the agent's context each turn, so a project with a long memory history is
+better seeded selectively than wholesale.
+
+Address a seeded agent with `letta --agent <id>`. `letta -n <name>` fails with
+"--name cannot be used with --agent" even when no `--agent` is passed, which is
+a letta 0.34.31 bug rather than anything the bridge controls.
+
 Round trips settle: `import` then `export` leaves both sides reporting
 "nothing to do", and `letta memory tokens --memory-dir <dir>` parses what the
 bridge writes. Only `description` and the body are compared, since
@@ -321,6 +342,7 @@ herdr-infinity run [--] [infinity arguments...]
 herdr-infinity sessions [--all] [--here]
 herdr-infinity memfs <import|export|status> [--memory-dir <dir>]
                                            [--claude-dir <dir>] [--dry-run]
+                                           [--into <dir>] [--only-types <list>]
 herdr-infinity open <session-prefix> [--focus]
 herdr-infinity new [--focus]
 herdr-infinity doctor
