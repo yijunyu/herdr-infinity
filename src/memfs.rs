@@ -48,10 +48,16 @@ impl Memo {
         ) + "\n"
     }
 
-    /// Render in MemFS's format, which only requires `description`.
+    /// Render in MemFS's format.
+    ///
+    /// Both `name` and `description` are required: Letta validates memory on
+    /// commit and rejects a file missing either, so a `description`-only file
+    /// is written but then refused by the MemFS git hook. `metadata` has no
+    /// MemFS equivalent and is left out.
     pub fn to_memfs(&self) -> String {
         format!(
-            "---\ndescription: {}\n---\n\n{}",
+            "---\nname: {}\ndescription: {}\n---\n\n{}",
+            self.name,
             self.description,
             self.body.trim_end()
         ) + "\n"
@@ -484,10 +490,11 @@ Herdr runs plugin commands with the server's PATH.
         assert_eq!(back.body.trim(), memo.body.trim());
 
         let memfs = back.to_memfs();
-        assert!(memfs.starts_with("---\ndescription:"));
-        // MemFS only needs description; no name or metadata leaks in.
+        // Letta validates on commit and requires both fields.
+        assert!(memfs.contains("name: plugin-path"), "{memfs}");
+        assert!(memfs.contains("description:"), "{memfs}");
+        // `metadata` is Claude Code-only and must not leak in.
         assert!(!memfs.contains("metadata"));
-        assert!(!memfs.contains("name:"));
     }
 
     #[test]
@@ -603,7 +610,9 @@ Herdr runs plugin commands with the server's PATH.
         assert_eq!(plan.changes, [Change::Create("plugin-path".to_owned())]);
 
         let written = std::fs::read_to_string(memfs.join("system/plugin-path.md")).unwrap();
-        assert!(written.starts_with("---\ndescription:"));
+        // Letta requires both name and description; metadata is ours alone.
+        assert!(written.contains("name: plugin-path"), "{written}");
+        assert!(written.contains("description:"), "{written}");
         assert!(!written.contains("metadata"));
         assert!(!memfs.join("system/MEMORY.md").exists());
     }
