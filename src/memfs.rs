@@ -1080,4 +1080,48 @@ Not a questionnaire.
         let explicit = resolve_claude_dir(Some(PathBuf::from("/tmp/x")), Path::new("/ignored"));
         assert_eq!(explicit.unwrap(), PathBuf::from("/tmp/x"));
     }
+
+    #[test]
+    fn an_indexed_export_keeps_the_root_untouched() {
+        let root = tempfile::tempdir().unwrap();
+        let claude = root.path().join("claude");
+        let memfs = root.path().join("memfs");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(
+            claude.join("guidance.md"),
+            "---\nname: guidance\ndescription: d\nmetadata:\n  type: feedback\n---\n\nbody\n",
+        )
+        .unwrap();
+
+        let plan = export_indexed(&memfs, &claude, "project", &Filter::default(), false).unwrap();
+        assert_eq!(plan.changes.len(), 1);
+
+        // The fact lands in the child directory, never in the root, because the
+        // root is the agent's permanent prompt.
+        assert!(memfs.join("project/guidance.md").exists());
+        assert!(!memfs.join("guidance.md").exists());
+
+        // A child directory counts as memory only with its own index, and that
+        // index must stay frontmatter-free.
+        let index = std::fs::read_to_string(memfs.join("project/MEMORY.md")).unwrap();
+        assert!(index.starts_with("# project\n"), "{index}");
+        assert!(!index.contains("---"), "{index}");
+        assert!(index.contains("guidance"), "{index}");
+    }
+
+    #[test]
+    fn a_subdirectory_name_cannot_escape_the_memory_root() {
+        let root = tempfile::tempdir().unwrap();
+        let claude = root.path().join("claude");
+        let memfs = root.path().join("memfs");
+        std::fs::create_dir_all(&claude).unwrap();
+
+        // A path would write outside the agent's memory; a dotfile would hide
+        // from the index. Neither is a usable directory name.
+        for bad in ["", "../escape", "nested/dir", ".hidden"] {
+            let error = export_indexed(&memfs, &claude, bad, &Filter::default(), false)
+                .expect_err("{bad} must be rejected");
+            assert!(error.contains("invalid memory subdirectory"), "{error}");
+        }
+    }
 }
