@@ -325,6 +325,12 @@ pub struct FrameReader {
     buffer: Vec<u8>,
 }
 
+impl Default for FrameReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FrameReader {
     pub fn new() -> Self {
         Self { buffer: Vec::new() }

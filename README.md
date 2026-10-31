@@ -293,11 +293,26 @@ value — but only where the foreground process is a plain shell. Herdr will not
 let an external report claim a pane whose foreground application it is already
 tracking, which is exactly the pane Letta occupies.
 
-So the route to the sidebar is the one this project uses for Infinity: a
-resident wrapper that *owns* the pane and reports its own state. For Letta
-that is harder than for Infinity, which has a daemon to subscribe to; a
-wrapper would have to infer state from the conversation log under
-`~/.letta/lc-local-backend/` or from the TUI.
+`herdr-letta` takes the route this project uses for Infinity: it owns the pane
+and reports its own state, inferring it from the conversation log under
+`~/.letta/lc-local-backend/` (Letta has no daemon to subscribe to).
+
+```sh
+herdr-letta            # run Letta in this pane and report to Herdr
+herdr-letta doctor     # Herdr env, letta binary, backend, conversations
+```
+
+That **does** get Letta into the sidebar — `herdr agent list` shows
+`letta idle` with the conversation id the integration hook supplies. **Live
+state transitions do not work.** The initial claim lands because it is
+reported before Letta's TUI takes the foreground; afterwards Herdr pins the
+state and ignores further reports, so `--state working` exits 0 and changes
+nothing. Letta stays at `idle` while it is visibly generating.
+
+Infinity avoids this because Herdr recognises `infinity` and treats its
+reports as the agent's own. For an agent Herdr cannot identify, the claim is
+honoured once and then frozen, so transitions need either Herdr-side support
+for Letta or an `agent-detection` manifest that matches its TUI.
 
 ## Commands
 

@@ -10,12 +10,7 @@
 //! The wrapper is deliberately a shim around the real `infinity` binary. It
 //! never edits Infinity's files and never changes the agent's behaviour.
 
-mod herdr;
-mod infinity;
-mod memfs;
-mod plugin;
-mod sessions;
-mod shim;
+use herdr_integration::{herdr, infinity, memfs, plugin, shim};
 
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
@@ -348,7 +343,9 @@ fn cmd_doctor() -> Result<ExitCode, String> {
         Err(error) => println!("infinity binary: NOT FOUND ({error})"),
     }
 
-    let socket = home_dir().join(".infinity").join("daemon.sock");
+    let socket = herdr_integration::home_dir()
+        .join(".infinity")
+        .join("daemon.sock");
     println!(
         "infinity daemon socket: {} (exists: {})",
         socket.display(),
@@ -431,10 +428,4 @@ fn cmd_uninstall_shim(args: &[String]) -> Result<ExitCode, String> {
     let path = shim::uninstall_shim(dir)?;
     println!("removed shim: {}", path.display());
     Ok(ExitCode::SUCCESS)
-}
-
-pub(crate) fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"))
 }

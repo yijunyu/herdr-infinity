@@ -12,6 +12,48 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// Which agent a reporter speaks for.
+///
+/// Herdr keys a pane claim on the agent label, and the resume command differs
+/// per agent, so both travel together. The source id is what Herdr attributes
+/// the report to; any value is accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentKind {
+    /// Herdr's agent label, e.g. `infinity` or `letta`.
+    pub label: &'static str,
+    /// The `--source` id Herdr records the report under.
+    pub source: &'static str,
+}
+
+impl AgentKind {
+    pub const INFINITY: Self = Self {
+        label: "infinity",
+        source: "herdr-infinity",
+    };
+    pub const LETTA: Self = Self {
+        label: "letta",
+        source: "herdr-letta",
+    };
+
+    /// The argv that reopens a session in a fresh pane, so a Herdr restart
+    /// returns to the same conversation.
+    fn resume(&self, session: &str) -> Vec<String> {
+        match self.label {
+            "letta" => vec!["letta".to_owned(), "--agent".to_owned(), session.to_owned()],
+            // Infinity is reopened through the wrapper so the new pane keeps
+            // reporting its state.
+            _ => vec![
+                "herdr-infinity".to_owned(),
+                "run".to_owned(),
+                "--".to_owned(),
+                "infinity".to_owned(),
+                "-s".to_owned(),
+                session.to_owned(),
+            ],
+        }
+    }
+}
+
 /// A state Herdr understands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentState {
@@ -53,13 +95,24 @@ enum Job {
     Sync(Sender<()>),
 }
 
+impl Default for Reporter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Reporter {
+    /// A reporter for Infinity, the original caller.
     pub fn new() -> Self {
+        Self::for_agent(AgentKind::INFINITY)
+    }
+
+    pub fn for_agent(kind: AgentKind) -> Self {
         if !active() {
             return Self { tx: None };
         }
         let (tx, rx) = channel();
-        std::thread::spawn(move || worker(rx));
+        std::thread::spawn(move || worker(rx, kind));
         Self { tx: Some(tx) }
     }
 
@@ -100,7 +153,7 @@ impl Reporter {
     }
 }
 
-fn worker(rx: Receiver<Job>) {
+fn worker(rx: Receiver<Job>, kind: AgentKind) {
     let mut last_seq = now_nanos();
     let mut pending: Option<Job> = None;
 
@@ -148,7 +201,7 @@ fn worker(rx: Receiver<Job>) {
                 resume,
             } => {
                 last_seq = now_nanos().max(last_seq.saturating_add(1));
-                let mut cmd = base_command(false, last_seq);
+                let mut cmd = base_command(kind, false, last_seq);
                 cmd.arg("--state").arg(state.as_str());
                 if let Some(message) = message {
                     cmd.arg("--message").arg(message);
@@ -158,20 +211,14 @@ fn worker(rx: Receiver<Job>) {
                 }
                 if resume {
                     if let Some(session) = &session {
-                        cmd.arg("--")
-                            .arg("herdr-infinity")
-                            .arg("run")
-                            .arg("--")
-                            .arg("infinity")
-                            .arg("-s")
-                            .arg(session);
+                        cmd.arg("--").args(kind.resume(session));
                     }
                 }
                 run_with_timeout(cmd);
             }
             Job::Release => {
                 last_seq = now_nanos().max(last_seq.saturating_add(1));
-                run_with_timeout(base_command(true, last_seq));
+                run_with_timeout(base_command(kind, true, last_seq));
             }
             Job::Sync(ack) => {
                 let _ = ack.send(());
@@ -180,7 +227,7 @@ fn worker(rx: Receiver<Job>) {
     }
 }
 
-fn base_command(release: bool, seq: u64) -> Command {
+fn base_command(kind: AgentKind, release: bool, seq: u64) -> Command {
     let bin = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
     let pane = std::env::var_os("HERDR_PANE_ID").unwrap_or_default();
     let mut cmd = Command::new(bin);
@@ -192,9 +239,9 @@ fn base_command(release: bool, seq: u64) -> Command {
         })
         .arg(pane)
         .arg("--source")
-        .arg("herdr-infinity")
+        .arg(kind.source)
         .arg("--agent")
-        .arg("infinity")
+        .arg(kind.label)
         .arg("--seq")
         .arg(seq.to_string())
         .stdin(Stdio::null())

@@ -11,6 +11,22 @@ readme = "README.md"
 keywords = ["herdr", "infinity", "agents", "terminal"]
 categories = ["command-line-utilities", "development-tools"]
 
+[lib]
+name = "herdr_integration"
+path = "src/lib.rs"
+
+[[bin]]
+name = "herdr-infinity"
+path = "src/main.rs"
+
+[[bin]]
+name = "deploy-letta"
+path = "src/bin/deploy-letta.rs"
+
+[[bin]]
+name = "herdr-letta"
+path = "src/bin/herdr-letta.rs"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
