@@ -280,16 +280,24 @@ Code 0.34.31 reports `agent: None, status: unknown` and never appears in
 `herdr integration install letta` reports `current (v1)`.
 
 The installed hook cannot fix this: it calls `pane report-agent-session`,
-which attaches a session id to an agent Herdr has *already* identified. A
-direct `pane report-agent --agent letta` exits 0 and changes nothing, so an
-unrecognised pane cannot be claimed from outside. The cause is identification
-rather than state rules — Herdr exposes no process command for the pane, only
-`terminal_title`, which Letta sets to the agent's name, and the process itself
-is `node`. A local `~/.config/herdr/agent-detection/letta.toml` override loads
-with no diagnostics and still does not produce detection.
+which attaches a session id to an agent Herdr has *already* identified. The
+cause is identification rather than state rules — Herdr exposes no process
+command for the pane, only `terminal_title`, which Letta sets to the agent's
+name, and the process itself is `node`. A local
+`~/.config/herdr/agent-detection/letta.toml` override loads with no
+diagnostics and still does not produce detection.
 
-The mechanism that does work is the one this project uses for Infinity: a
-resident wrapper that reports its own state through `pane report-agent`.
+Reporting itself is not the obstacle. `pane report-agent --agent letta` claims
+a pane and follows `idle`/`working`/`blocked` normally, with any `--source`
+value — but only where the foreground process is a plain shell. Herdr will not
+let an external report claim a pane whose foreground application it is already
+tracking, which is exactly the pane Letta occupies.
+
+So the route to the sidebar is the one this project uses for Infinity: a
+resident wrapper that *owns* the pane and reports its own state. For Letta
+that is harder than for Infinity, which has a daemon to subscribe to; a
+wrapper would have to infer state from the conversation log under
+`~/.letta/lc-local-backend/` or from the TUI.
 
 ## Commands
 
