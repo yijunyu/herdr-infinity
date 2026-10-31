@@ -12,10 +12,19 @@
 set -eu
 
 # Derive the plugin root from this script's own location when Herdr has not
-# supplied it. `dirname` twice avoids `cd`, so a stray CDPATH cannot interfere
-# and the path needs no subshell gymnastics.
-self_dir=$(dirname -- "$0")
-root="${HERDR_PLUGIN_ROOT:-$(dirname -- "$self_dir")}"
+# supplied it. Done with parameter expansion rather than `dirname`, because
+# this runs with the Herdr server's environment: PATH may not contain
+# coreutils, and the fallback must not depend on an external command. Avoiding
+# `cd` also means a stray CDPATH cannot interfere.
+if [ -n "${HERDR_PLUGIN_ROOT:-}" ]; then
+    root=$HERDR_PLUGIN_ROOT
+else
+    # "$0" -> its directory -> that directory's parent.
+    self_dir=${0%/*}
+    [ "$self_dir" = "$0" ] && self_dir=.
+    root=${self_dir%/*}
+    [ "$root" = "$self_dir" ] && root=..
+fi
 
 candidates="
 ${HERDR_INFINITY_BIN:-}
