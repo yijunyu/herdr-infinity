@@ -166,7 +166,21 @@ path separators with dashes, under
 
 ## 6. Known external limit
 
-`letta -n <name>` fails with "--name cannot be used with --agent" even when no
-`--agent` is passed, and even for a pre-existing pinned agent. This is a letta
-0.34.31 bug, not a consequence of anything the bridge does. Address a seeded
-agent with `letta --agent <id>`.
+`letta -n <name> -p "<prompt>"` fails with "--name cannot be used with --agent"
+even when no `--agent` is passed, and even for a pre-existing pinned agent.
+This is a letta bug, not a consequence of anything the bridge does; it still
+reproduces on 0.34.36.
+
+It is specific to the headless (`-p`) path. Name resolution itself works — an
+unknown name gives "No pinned agent found" — and the interactive path accepts
+the flag, so `letta -n <name> --resume` gets as far as "No prompt provided".
+So the headless startup appears to populate its internal agent id from the
+resumed session before validating it against `--name`.
+
+Address a seeded agent by resolving the name to an id first:
+
+```bash
+letta agents list > agents.json   # redirect; the JSON is ~88 KB
+ID=$(python3 -c "import json;print(next(a['id'] for a in json.load(open('agents.json'))['items'] if a['name']=='<name>'))")
+letta --agent "$ID" -p "<prompt>"
+```
