@@ -26,6 +26,11 @@ const DAEMON_POLL: Duration = Duration::from_millis(1500);
 pub struct Session {
     pub id: String,
     pub cwd: PathBuf,
+    /// The host `cwd` lives on. `None` means nothing told us, which is why
+    /// the pane prints the directory unqualified rather than assuming local:
+    /// a session on `ada` whose path also exists here would otherwise read
+    /// as a local folder.
+    pub host: Option<String>,
     /// `Running`, `Idle`, `WaitingForChoice`, ... or `None` when the daemon did
     /// not mention this session (it is on disk but not live).
     pub status: Option<String>,
@@ -62,6 +67,12 @@ pub fn collect(
         .map(|(id, entry)| Session {
             id: id.clone(),
             cwd: entry.cwd.clone(),
+            // The daemon's live view wins over the store's record: a session
+            // that migrated hosts has a stale host on disk until it flushes.
+            host: daemon
+                .get(id)
+                .and_then(|info| info.host.clone())
+                .or_else(|| entry.host.clone()),
             status: daemon.get(id).map(|info| info.status.clone()),
             last_updated: daemon.get(id).map(|info| info.last_updated.clone()),
             archived: entry.archived,
@@ -75,6 +86,7 @@ pub fn collect(
             sessions.push(Session {
                 id: id.clone(),
                 cwd: PathBuf::new(),
+                host: info.host.clone(),
                 status: Some(info.status.clone()),
                 last_updated: Some(info.last_updated.clone()),
                 archived: info.status == "Archived",
@@ -181,29 +193,67 @@ pub fn render_table(sessions: &[Session]) -> String {
         .max()
         .unwrap_or(6)
         .max(6);
+    // Only widen for a HOST column when some session actually reports one.
+    // With no remote sessions the table keeps its original three columns, so
+    // the common local case is unchanged.
+    let any_host = sessions.iter().any(|session| session.host.is_some());
+    let host_width = sessions
+        .iter()
+        .filter_map(|session| session.host.as_deref())
+        .map(str::len)
+        .max()
+        .unwrap_or(4)
+        .max(4);
 
-    let mut out = format!(
-        "{:<id_width$}  {:<status_width$}  {}\n",
-        "ID",
-        "STATUS",
-        "DIRECTORY",
-        id_width = id_width,
-        status_width = status_width
-    );
+    let mut out = if any_host {
+        format!(
+            "{:<id_width$}  {:<status_width$}  {:<host_width$}  {}\n",
+            "ID",
+            "STATUS",
+            "HOST",
+            "DIRECTORY",
+            id_width = id_width,
+            status_width = status_width,
+            host_width = host_width
+        )
+    } else {
+        format!(
+            "{:<id_width$}  {:<status_width$}  {}\n",
+            "ID",
+            "STATUS",
+            "DIRECTORY",
+            id_width = id_width,
+            status_width = status_width
+        )
+    };
     for session in sessions {
         let cwd = if session.cwd.as_os_str().is_empty() {
             "<unknown>".to_owned()
         } else {
             session.cwd.display().to_string()
         };
-        out.push_str(&format!(
-            "{:<id_width$}  {:<status_width$}  {}\n",
-            session.id,
-            session.status_label(),
-            cwd,
-            id_width = id_width,
-            status_width = status_width
-        ));
+        if any_host {
+            // "-" where the host is unreported. NOT "local": see Session::host.
+            out.push_str(&format!(
+                "{:<id_width$}  {:<status_width$}  {:<host_width$}  {}\n",
+                session.id,
+                session.status_label(),
+                session.host.as_deref().unwrap_or("-"),
+                cwd,
+                id_width = id_width,
+                status_width = status_width,
+                host_width = host_width
+            ));
+        } else {
+            out.push_str(&format!(
+                "{:<id_width$}  {:<status_width$}  {}\n",
+                session.id,
+                session.status_label(),
+                cwd,
+                id_width = id_width,
+                status_width = status_width
+            ));
+        }
     }
     out
 }
@@ -226,6 +276,7 @@ mod tests {
     fn entry(cwd: &str, archived: bool) -> SessionEntry {
         SessionEntry {
             cwd: PathBuf::from(cwd),
+            host: None,
             shut_down: false,
             idle: false,
             archived,
@@ -235,8 +286,105 @@ mod tests {
     fn info(status: &str, updated: &str) -> infinity::SessionInfo {
         infinity::SessionInfo {
             last_updated: updated.to_owned(),
+            host: None,
             status: status.to_owned(),
         }
+    }
+
+    /// A remote session must be labelled with the host its directory is on.
+    /// Without this the pane printed `ada`'s cwd as if it were local, and a
+    /// path that also exists here was indistinguishable from a local folder.
+    #[test]
+    fn renders_a_host_column_when_a_session_reports_one() {
+        let sessions = vec![
+            Session {
+                id: "local-1".to_owned(),
+                cwd: PathBuf::from("/home/u/proj"),
+                host: None,
+                status: Some("Idle".to_owned()),
+                last_updated: None,
+                archived: false,
+            },
+            Session {
+                id: "ada-1".to_owned(),
+                cwd: PathBuf::from("/home/u/remote-proj"),
+                host: Some("ada".to_owned()),
+                status: Some("Running".to_owned()),
+                last_updated: None,
+                archived: false,
+            },
+        ];
+        let table = render_table(&sessions);
+        assert!(table.contains("HOST"), "no HOST header: {table}");
+        assert!(table.contains("ada"), "host not shown: {table}");
+        // The remote row carries BOTH its host and that host's directory.
+        let ada = table
+            .lines()
+            .find(|l| l.starts_with("ada-1"))
+            .expect("no ada row");
+        assert!(ada.contains("ada"), "{ada}");
+        assert!(ada.contains("/home/u/remote-proj"), "{ada}");
+        // Unreported reads as "-", never as the local hostname: inventing
+        // "local" here is the confidently-wrong label this avoids.
+        let local = table
+            .lines()
+            .find(|l| l.starts_with("local-1"))
+            .expect("no local row");
+        assert!(local.contains(" - "), "unreported host not '-': {local}");
+    }
+
+    /// With no remote sessions the table keeps its original three columns, so
+    /// the common all-local listing is not widened by a column of dashes.
+    #[test]
+    fn omits_the_host_column_when_nothing_reports_a_host() {
+        let sessions = vec![Session {
+            id: "only".to_owned(),
+            cwd: PathBuf::from("/work"),
+            host: None,
+            status: Some("Idle".to_owned()),
+            last_updated: None,
+            archived: false,
+        }];
+        let table = render_table(&sessions);
+        assert!(!table.contains("HOST"), "HOST shown with no hosts: {table}");
+        assert!(table.contains("DIRECTORY"), "{table}");
+    }
+
+    /// The store records a host too, for a session the daemon is not
+    /// reporting (on disk but not live).
+    #[test]
+    fn takes_the_host_from_the_store_when_the_daemon_is_silent() {
+        let mut store = HashMap::new();
+        let mut e = entry("/home/u/p", false);
+        e.host = Some("ada".to_owned());
+        store.insert("s1".to_owned(), e);
+        let sessions = collect(&store, &HashMap::new());
+        assert_eq!(sessions[0].host.as_deref(), Some("ada"));
+    }
+
+    /// A session that migrated hosts has a stale host on disk until it
+    /// flushes, so the daemon's live value wins.
+    #[test]
+    fn daemon_host_overrides_a_stale_store_host() {
+        let mut store = HashMap::new();
+        let mut e = entry("/home/u/p", false);
+        e.host = Some("old-host".to_owned());
+        store.insert("s1".to_owned(), e);
+        let mut daemon = HashMap::new();
+        let mut i = info("Running", "2026-11-08T00:00:00Z");
+        i.host = Some("ada".to_owned());
+        daemon.insert("s1".to_owned(), i);
+        let sessions = collect(&store, &daemon);
+        assert_eq!(sessions[0].host.as_deref(), Some("ada"));
+    }
+
+    /// An existing store has no host key at all; it must still parse, and
+    /// must not be reported as some guessed host.
+    #[test]
+    fn a_store_without_a_host_key_parses_as_unreported() {
+        let e: SessionEntry =
+            serde_json::from_str(r#"{"cwd":"/work","archived":false}"#).expect("parses");
+        assert_eq!(e.host, None);
     }
 
     #[test]
@@ -292,6 +440,7 @@ mod tests {
             Session {
                 id: "abc-1".to_owned(),
                 cwd: PathBuf::from("/work"),
+                host: None,
                 status: None,
                 last_updated: None,
                 archived: false,
@@ -299,6 +448,7 @@ mod tests {
             Session {
                 id: "abc-2".to_owned(),
                 cwd: PathBuf::from("/work"),
+                host: None,
                 status: None,
                 last_updated: None,
                 archived: false,
@@ -306,6 +456,7 @@ mod tests {
             Session {
                 id: "xyz".to_owned(),
                 cwd: PathBuf::from("/work"),
+                host: None,
                 status: None,
                 last_updated: None,
                 archived: false,
@@ -327,6 +478,7 @@ mod tests {
             Session {
                 id: "here".to_owned(),
                 cwd: PathBuf::from("/work/project"),
+                host: None,
                 status: None,
                 last_updated: None,
                 archived: false,
@@ -334,6 +486,7 @@ mod tests {
             Session {
                 id: "elsewhere".to_owned(),
                 cwd: PathBuf::from("/other"),
+                host: None,
                 status: None,
                 last_updated: None,
                 archived: false,
@@ -341,6 +494,7 @@ mod tests {
             Session {
                 id: "unknown".to_owned(),
                 cwd: PathBuf::new(),
+                host: None,
                 status: None,
                 last_updated: None,
                 archived: false,
@@ -359,6 +513,7 @@ mod tests {
         let sessions = vec![Session {
             id: "abc".to_owned(),
             cwd: PathBuf::from("/work/project"),
+            host: None,
             status: Some("Running".to_owned()),
             last_updated: None,
             archived: false,

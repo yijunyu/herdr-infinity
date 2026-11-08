@@ -36,6 +36,14 @@ const FOLLOW_MAX: Duration = Duration::from_secs(6 * 3600);
 pub struct SessionInfo {
     #[serde(default)]
     pub last_updated: String,
+    /// The host the session actually runs on, when the daemon says so.
+    /// `None` means "not reported", which is NOT the same as "local": the
+    /// daemon protocol carries no host field today, so every live session
+    /// reads as unreported until it does. The pane must not print a host it
+    /// was not told, because a directory labelled with the wrong machine is
+    /// worse than one labelled with none.
+    #[serde(default)]
+    pub host: Option<String>,
     /// `Running`, `Idle`, `Stopped`, `WaitingForChoice`, `Migrating`, or
     /// `Archived` today; kept as a string so a future status never breaks the
     /// bridge.
@@ -46,6 +54,10 @@ pub struct SessionInfo {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SessionEntry {
     pub cwd: PathBuf,
+    /// The host `cwd` is a path ON. Absent in every store written so far, so
+    /// it defaults to `None` and existing files keep parsing unchanged.
+    #[serde(default)]
+    pub host: Option<String>,
     #[serde(default)]
     pub shut_down: bool,
     #[serde(default)]
@@ -585,6 +597,7 @@ mod tests {
             "old".to_owned(),
             SessionEntry {
                 cwd: PathBuf::from("/work/project"),
+                host: None,
                 shut_down: false,
                 idle: true,
                 archived: false,
@@ -601,6 +614,7 @@ mod tests {
             "old".to_owned(),
             SessionEntry {
                 cwd: PathBuf::from("/work/project"),
+                host: None,
                 shut_down: false,
                 idle: true,
                 archived: false,
@@ -610,6 +624,7 @@ mod tests {
             "new".to_owned(),
             SessionEntry {
                 cwd: PathBuf::from("/work/project"),
+                host: None,
                 shut_down: false,
                 idle: false,
                 archived: false,
