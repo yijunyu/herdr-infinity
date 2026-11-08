@@ -200,7 +200,22 @@ pub fn load() -> Vec<Session> {
 }
 
 /// Render a listing as aligned text for the picker pane and `sessions` output.
+///
+/// The HOST column shows the remote's label, which is what Infinity itself
+/// prefixes onto the id. When `~/.infinity/remotes.json` also gives that
+/// label an SSH target, it is shown in parentheses -- `ada (ada.example.com)`
+/// -- because the label alone does not say which machine it reaches, and that
+/// is the one thing remotes.json knows and the id does not.
 pub fn render_table(sessions: &[Session]) -> String {
+    render_table_with_remotes(sessions, &infinity::read_remotes())
+}
+
+/// `render_table`, with the remotes map injected so it can be tested without
+/// a `~/.infinity/remotes.json` on the machine running the tests.
+pub fn render_table_with_remotes(
+    sessions: &[Session],
+    remotes: &HashMap<String, infinity::Remote>,
+) -> String {
     if sessions.is_empty() {
         return "No Infinity sessions found.\n".to_owned();
     }
@@ -221,10 +236,19 @@ pub fn render_table(sessions: &[Session]) -> String {
     // With no remote sessions the table keeps its original three columns, so
     // the common local case is unchanged.
     let any_host = sessions.iter().any(|session| session.host.is_some());
+    // The cell for a session's host: the label, plus the SSH target behind it
+    // when remotes.json names one.
+    let host_cell = |session: &Session| -> Option<String> {
+        let label = session.host.as_deref()?;
+        match remotes.get(label).and_then(infinity::Remote::ssh_target) {
+            Some(target) if target != label => Some(format!("{label} ({target})")),
+            _ => Some(label.to_owned()),
+        }
+    };
     let host_width = sessions
         .iter()
-        .filter_map(|session| session.host.as_deref())
-        .map(str::len)
+        .filter_map(host_cell)
+        .map(|cell| cell.len())
         .max()
         .unwrap_or(4)
         .max(4);
@@ -262,7 +286,7 @@ pub fn render_table(sessions: &[Session]) -> String {
                 "{:<id_width$}  {:<status_width$}  {:<host_width$}  {}\n",
                 session.id,
                 session.status_label(),
-                session.host.as_deref().unwrap_or("-"),
+                host_cell(session).as_deref().unwrap_or("-"),
                 cwd,
                 id_width = id_width,
                 status_width = status_width,
@@ -313,6 +337,86 @@ mod tests {
             host: None,
             status: status.to_owned(),
         }
+    }
+
+    fn remote(name: &str, args: &[&str]) -> infinity::Remote {
+        serde_json::from_str(&format!(
+            r#"{{"name":"{name}","ssh_args":{}}}"#,
+            serde_json::to_string(args).expect("args")
+        ))
+        .expect("remote parses")
+    }
+
+    /// remotes.json does not RENAME anything -- `name` is already the label
+    /// Infinity prefixes onto the id. What it adds is the machine behind that
+    /// label, which the id cannot tell you.
+    #[test]
+    fn shows_the_ssh_target_behind_the_label() {
+        let sessions = vec![Session {
+            id: "ada/abc".to_owned(),
+            cwd: PathBuf::from("/home/u/p"),
+            host: Some("ada".to_owned()),
+            status: Some("Running".to_owned()),
+            last_updated: None,
+            archived: false,
+        }];
+        let mut remotes = HashMap::new();
+        remotes.insert("ada".to_owned(), remote("ada", &["ada.example.com"]));
+        let table = render_table_with_remotes(&sessions, &remotes);
+        assert!(table.contains("ada (ada.example.com)"), "{table}");
+    }
+
+    /// An unconfigured label still prints, on its own. A session can name a
+    /// remote that is no longer in remotes.json.
+    #[test]
+    fn an_unconfigured_label_stands_alone() {
+        let sessions = vec![Session {
+            id: "gone/abc".to_owned(),
+            cwd: PathBuf::from("/p"),
+            host: Some("gone".to_owned()),
+            status: None,
+            last_updated: None,
+            archived: false,
+        }];
+        let table = render_table_with_remotes(&sessions, &HashMap::new());
+        assert!(table.contains("gone"), "{table}");
+        assert!(!table.contains("("), "no parens without a target: {table}");
+    }
+
+    /// Flags are not hostnames. `-i key` and friends must not be printed as
+    /// the machine; the value after a value-taking option is skipped too.
+    #[test]
+    fn ssh_target_skips_flags_and_their_values() {
+        assert_eq!(
+            remote("r", &["-i", "/k/id_ed25519", "host.example"]).ssh_target(),
+            Some("host.example")
+        );
+        assert_eq!(
+            remote("r", &["-J", "jump.example", "target.example"]).ssh_target(),
+            Some("target.example")
+        );
+        assert_eq!(remote("r", &["user@host"]).ssh_target(), Some("user@host"));
+        // All flags and no target: the label stands alone rather than showing
+        // a flag as if it were a machine.
+        assert_eq!(remote("r", &["-v"]).ssh_target(), None);
+        assert_eq!(remote("r", &[]).ssh_target(), None);
+    }
+
+    /// A label equal to its target is not worth repeating.
+    #[test]
+    fn does_not_repeat_a_label_that_equals_its_target() {
+        let sessions = vec![Session {
+            id: "h/abc".to_owned(),
+            cwd: PathBuf::from("/p"),
+            host: Some("h".to_owned()),
+            status: None,
+            last_updated: None,
+            archived: false,
+        }];
+        let mut remotes = HashMap::new();
+        remotes.insert("h".to_owned(), remote("h", &["h"]));
+        let table = render_table_with_remotes(&sessions, &remotes);
+        assert!(!table.contains("h (h)"), "{table}");
     }
 
     /// Infinity shows a remote session as `devbox/def456`, so the host is

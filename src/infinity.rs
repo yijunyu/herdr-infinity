@@ -72,6 +72,65 @@ struct StoreFile {
     sessions: HashMap<String, SessionEntry>,
 }
 
+/// One entry of `~/.infinity/remotes.json`, which Infinity writes as a flat
+/// array:
+///
+/// ```json
+/// [ { "name": "devbox", "ssh_args": ["my-devbox.example.com"] } ]
+/// ```
+///
+/// `name` is ALREADY the friendly label -- upstream calls it "a short label
+/// for this remote" and prefixes it onto a remote session's id as
+/// `devbox/def456`. So this file does not rename anything; what it adds is
+/// the SSH target behind the label, which is the part a reader cannot guess
+/// from the id, and the set of configured remotes.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Remote {
+    pub name: String,
+    #[serde(default)]
+    pub ssh_args: Vec<String>,
+}
+
+impl Remote {
+    /// The SSH target to show beside the label: the first non-flag argument,
+    /// which is the host in every documented form (`my-devbox.example.com`,
+    /// `user@host`). Flags are skipped rather than guessed at, and `None`
+    /// means the entry is all flags -- then the label stands alone, because
+    /// printing a flag as if it were a hostname would be worse than nothing.
+    pub fn ssh_target(&self) -> Option<&str> {
+        let mut args = self.ssh_args.iter();
+        while let Some(arg) = args.next() {
+            if !arg.starts_with('-') {
+                return Some(arg);
+            }
+            // A flag. The short options that take a SEPARATE value consume
+            // the next argument too, or that value would be read as the
+            // host: `-i /k/id` must not report "/k/id" as the machine.
+            if matches!(arg.as_str(), "-i" | "-p" | "-l" | "-o" | "-J" | "-F") {
+                args.next();
+            }
+        }
+        None
+    }
+}
+
+/// Read `~/.infinity/remotes.json`. A missing or malformed file is an empty
+/// map, not an error: remotes are optional, and a listing must still work
+/// when none are configured.
+pub fn read_remotes() -> HashMap<String, Remote> {
+    let path = crate::home_dir().join(".infinity").join("remotes.json");
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return HashMap::new();
+    };
+    let Ok(remotes) = serde_json::from_str::<Vec<Remote>>(&contents) else {
+        return HashMap::new();
+    };
+    remotes
+        .into_iter()
+        .map(|remote| (remote.name.clone(), remote))
+        .collect()
+}
+
 /// Read `~/.infinity/sessions.json`, which records each session's cwd and
 /// lifecycle flags. Missing or malformed files are treated as empty.
 pub fn read_store_sessions() -> HashMap<String, SessionEntry> {
