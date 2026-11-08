@@ -54,6 +54,26 @@ impl Session {
     }
 }
 
+/// The remote name Infinity itself prefixes onto a remote session's id.
+///
+/// Infinity names remotes in `~/.infinity/remotes.json` ("a short label for
+/// this remote; shows as a prefix in the session picker") and shows a remote
+/// session as `devbox/def456`. So the host is already carried IN THE ID, and
+/// herdr was dropping it: the id went into the table verbatim while the cwd
+/// beside it -- a path on `devbox` -- was printed as if it were local.
+///
+/// Returns `(host, bare_id)`, or `None` when the id has no prefix, which is
+/// what a local session looks like. Only a single leading segment counts: a
+/// session id is opaque otherwise, and splitting on every slash would invent
+/// a host out of any id that happens to contain one.
+fn split_remote_id(id: &str) -> Option<(String, String)> {
+    let (host, rest) = id.split_once('/')?;
+    if host.is_empty() || rest.is_empty() || rest.contains('/') {
+        return None;
+    }
+    Some((host.to_owned(), rest.to_owned()))
+}
+
 /// Collect sessions from the store, joined with the daemon's live view.
 ///
 /// `daemon` may be empty: a missing or unreachable daemon degrades the listing
@@ -72,7 +92,8 @@ pub fn collect(
             host: daemon
                 .get(id)
                 .and_then(|info| info.host.clone())
-                .or_else(|| entry.host.clone()),
+                .or_else(|| entry.host.clone())
+                .or_else(|| split_remote_id(id).map(|(host, _)| host)),
             status: daemon.get(id).map(|info| info.status.clone()),
             last_updated: daemon.get(id).map(|info| info.last_updated.clone()),
             archived: entry.archived,
@@ -86,7 +107,10 @@ pub fn collect(
             sessions.push(Session {
                 id: id.clone(),
                 cwd: PathBuf::new(),
-                host: info.host.clone(),
+                host: info
+                    .host
+                    .clone()
+                    .or_else(|| split_remote_id(id).map(|(host, _)| host)),
                 status: Some(info.status.clone()),
                 last_updated: Some(info.last_updated.clone()),
                 archived: info.status == "Archived",
@@ -289,6 +313,57 @@ mod tests {
             host: None,
             status: status.to_owned(),
         }
+    }
+
+    /// Infinity shows a remote session as `devbox/def456`, so the host is
+    /// already in the id. herdr was dropping it and printing the remote's cwd
+    /// as if it were local.
+    #[test]
+    fn derives_the_host_from_infinitys_remote_id_prefix() {
+        let mut store = HashMap::new();
+        store.insert("ada/abc123".to_owned(), entry("/home/u/remote-proj", false));
+        let sessions = collect(&store, &HashMap::new());
+        assert_eq!(sessions[0].host.as_deref(), Some("ada"));
+        // And it shows up in the pane beside that host's directory.
+        let table = render_table(&sessions);
+        assert!(table.contains("HOST"), "{table}");
+        assert!(table.contains("ada"), "{table}");
+        assert!(table.contains("/home/u/remote-proj"), "{table}");
+    }
+
+    /// A local session has no prefix and must not acquire a host.
+    #[test]
+    fn a_local_id_yields_no_host() {
+        let mut store = HashMap::new();
+        store.insert("abc123".to_owned(), entry("/work", false));
+        let sessions = collect(&store, &HashMap::new());
+        assert_eq!(sessions[0].host, None);
+    }
+
+    /// An explicit host beats the prefix: the prefix is a fallback, not the
+    /// truth, and a session that migrated has the right answer elsewhere.
+    #[test]
+    fn an_explicit_host_beats_the_id_prefix() {
+        let mut store = HashMap::new();
+        let mut e = entry("/work", false);
+        e.host = Some("real-host".to_owned());
+        store.insert("stale-prefix/abc".to_owned(), e);
+        let sessions = collect(&store, &HashMap::new());
+        assert_eq!(sessions[0].host.as_deref(), Some("real-host"));
+    }
+
+    /// Do not invent a host from an id that merely contains a slash. Only a
+    /// single leading segment is Infinity's remote convention.
+    #[test]
+    fn does_not_invent_a_host_from_a_multi_slash_id() {
+        assert_eq!(split_remote_id("a/b/c"), None);
+        assert_eq!(split_remote_id("/leading"), None);
+        assert_eq!(split_remote_id("trailing/"), None);
+        assert_eq!(split_remote_id("plain"), None);
+        assert_eq!(
+            split_remote_id("ada/abc"),
+            Some(("ada".to_owned(), "abc".to_owned()))
+        );
     }
 
     /// A remote session must be labelled with the host its directory is on.
